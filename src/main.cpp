@@ -27,8 +27,6 @@
 
 #define DB_LED_ON LOW
 #define DB_LED_OFF HIGH
-#define IR_LED_ON HIGH
-#define IR_LED_OFF LOW
 
 #define WEBSERVER_PORT 80
 
@@ -313,87 +311,6 @@ void breathe() {
   }
 }
 
-typedef struct config {
-  SerialConfig bits;
-  char name[4];
-} config_t;
-
-config_t configs[] = {
-  { SERIAL_5N1, "5N1" },
-  { SERIAL_6N1, "6N1" },
-  { SERIAL_7N1, "7N1" },
-  { SERIAL_8N1, "8N1" },
-  { SERIAL_5N2, "5N2" },
-  { SERIAL_6N2, "6N2" },
-  { SERIAL_7N2, "7N2" },
-  { SERIAL_8N2, "8N2" },
-  { SERIAL_5E1, "5E1" },
-  { SERIAL_6E1, "6E1" },
-  { SERIAL_7E1, "7E1" },
-  { SERIAL_8E1, "8E1" },
-  { SERIAL_5E2, "5E2" },
-  { SERIAL_6E2, "6E2" },
-  { SERIAL_7E2, "7E2" },
-  { SERIAL_8E2, "8E2" },
-  { SERIAL_5O1, "501" },
-  { SERIAL_6O1, "601" },
-  { SERIAL_7O1, "701" },
-  { SERIAL_8O1, "801" },
-  { SERIAL_5O2, "502" },
-  { SERIAL_6O2, "602" },
-  { SERIAL_7O2, "7O2" },
-  { SERIAL_8O2, "8O2" }
-};
-
-long speeds[] = {
-  110, 300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 256000
-};
-
-void check_serial() {
-  static uint32_t changed = 0;
-  static size_t config = ARRAY_SIZE(configs);
-  static size_t speed = ARRAY_SIZE(speeds);
-  static size_t pos = 0;
-  static char msg[160+1];
-
-  // check for speed or config change
-  uint32_t now = millis();
-  if( now - changed > 4000 ) {
-    changed = now;
-
-    if( pos > 0 ) {
-      msg[pos] = '\0';
-      syslog.logf(LOG_INFO, "Msg=%s\n", msg);
-      syslog.logf(LOG_INFO, "Hex=%s\n", to_hex(msg, pos, ' '));
-      pos = 0;
-    }
-    config++;
-    if( config >= ARRAY_SIZE(configs) ) {
-      config = 0;
-      speed++;
-      if( speed >= ARRAY_SIZE(speeds) ) {
-        speed = 0;
-      }
-    }
-    syslog.logf(LOG_INFO, "Speed=%ld, Config=%s\n", speeds[speed], configs[config].name);
-    Serial.end();
-    Serial.begin(speeds[speed], configs[config].bits);
-  }
-
-  // try reading from serial
-  int ch = Serial.read();
-  if( ch >= 0 ) {
-    counter_events++;
-    msg[pos++] = ch;
-    if( pos >= sizeof(msg) - 1 ) {
-      msg[pos] = '\0';
-      syslog.logf(LOG_INFO, "Msg=%s\n", msg);
-      syslog.logf(LOG_INFO, "Hex=%s\n", to_hex(msg, pos, ' '));
-      pos = 0;
-    }
-  }
-}
-
 typedef enum { SML_NONE=0, SML_OPEN=0x0101, SML_LIST=0x0701, SML_CLOSE=0x0201 } sml_message_t;
 
 char *itronString( itron_3hz_t *itron ) {
@@ -530,6 +447,7 @@ char *spaces(char *s, size_t indent) {
 
 /*
 SML parser (assuming valid SML 1.x)
+ itron: pointer to structure to store relevant values
  data:  sml data of unknown length (whole record or list)
  items: list items (or high number if unknown)
  level: of nested lists
@@ -758,8 +676,6 @@ void loop() {
     read_serial_sml();
   }
 
-  //check_serial();
-  //check_events();
   web_server.handleClient();
   delay(1);
 }
