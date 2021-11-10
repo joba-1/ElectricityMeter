@@ -264,28 +264,6 @@ bool check_ntptime() {
   return have_time;
 }
 
-void on_interval_elapsed(uint32_t elapsed, uint32_t counts) {
-  if ( !counts ) {
-    syslog.logf(LOG_NOTICE, "No SML record since %u seconds", elapsed / 1000);
-  }
-}
-
-void check_events() {
-  static const uint32_t max_interval = 600 * 1000; // ms to wait for Serial Rx
-
-  uint32_t now = millis();
-  uint32_t elapsed = now - last_counter_reset;
-  if (counter_events || elapsed >= max_interval) {
-    uint32_t events = counter_events;
-
-    counter_events = 0;
-    last_counter_reset += max_interval;
-
-    // either Serial Rx happened or log interval elapsed
-    on_interval_elapsed(elapsed, events);
-  }
-}
-
 void breathe() {
   static uint32_t start = 0;
   static uint32_t max_duty = PWMRANGE / 2; // limit max brightness
