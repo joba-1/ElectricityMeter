@@ -63,10 +63,12 @@ typedef struct itron_3hz {
   uint32_t uptime;
   uint64_t aPlus;
   uint64_t aMinus;
+  bool detailed;
 } itron_3hz_t;
 
 itron_3hz_t itron = {0};
 time_t recv_time = 0;
+bool recv_detailed = true;
 
 uint8_t sml_raw[2560];  // last sml record, enough for 2s at 9600 baud
 size_t sml_len = 0;  // length of last sml record
@@ -122,6 +124,7 @@ void setup_webserver() {
                               " \"energy\": {\n"
                               "  \"id\": \"%3.3s\",\n"
                               "  \"serial\": \"%s\",\n"
+                              "  \"detailed\": \"%s\",\n"
                               "  \"uptime\": %u,\n"
                               "  \"aplus\": %llu,\n"
                               "  \"aminus\": %llu\n"
@@ -134,7 +137,7 @@ void setup_webserver() {
     strftime(rec_time, sizeof(rec_time), "%FT%T%Z", localtime(&recv_time));
     char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
     snprintf(msg, sizeof(msg), fmt, start_time, inf_time, rec_time,
-             itron.id, serial, itron.uptime, itron.aPlus, itron.aMinus);
+             itron.id, serial, recv_detailed ? "yes" : "no", itron.uptime, itron.aPlus, itron.aMinus);
     web_server.send(200, "application/json", msg);
   });
 
@@ -180,19 +183,20 @@ void setup_webserver() {
       "  </tr></table>\n"
       "  <div>Post firmware image to /update<div>\n"
       "  <div>Influx status: %d<div>\n"
+      "  <div>Detailed info: %s<div>\n"
       " </body>\n"
       "</html>\n";
   static char page[sizeof(fmt) + 10] = "";
 
   // Index page
   web_server.on("/", []() {
-    snprintf(page, sizeof(page), fmt, influx_status);
+    snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no");
     web_server.send(200, "text/html", page);
   });
 
   // Catch all page
   web_server.onNotFound([]() {
-    snprintf(page, sizeof(page), fmt, influx_status);
+    snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no");
     web_server.send(404, "text/html", page);
   });
 
@@ -266,6 +270,7 @@ bool check_ntptime() {
 
 void breathe() {
   static uint32_t start = 0;
+  static uint32_t min_duty = PWMRANGE / 10; // limit min brightness
   static uint32_t max_duty = PWMRANGE / 2; // limit max brightness
   static uint32_t prev_duty = 0;
 
@@ -276,7 +281,7 @@ void breathe() {
     elapsed -= breathe_interval;
   }
 
-  uint32_t duty = max_duty * elapsed * 2 / breathe_interval;
+  uint32_t duty = (max_duty - min_duty) * elapsed * 2 / breathe_interval + min_duty;
   if (duty > max_duty) {
     duty = 2 * max_duty - duty;
   }
@@ -298,8 +303,8 @@ char *itronString( itron_3hz_t *itron ) {
   serial[sizeof(itron->serial) * 3 - 1] = '\0'; // cut last separator 
 
   snprintf(msg, sizeof(msg), 
-    "valid[0x3f]=0x%02x, id='%3.3s', serial='%s', record=%llu, uptime[s]=%u, A+[Wh]=%llu, A-[Wh]=%llu",
-    itron->valid, itron->id, serial, itron->file, itron->uptime, itron->aPlus, itron->aMinus);
+    "valid[0x3f]=0x%02x, detailed=%s, id='%3.3s', serial='%s', record=%llu, uptime[s]=%u, A+[Wh]=%llu, A-[Wh]=%llu",
+    itron->valid, itron->detailed ? "true" : "false", itron->id, serial, itron->file, itron->uptime, itron->aPlus, itron->aMinus);
 
   return msg;
 }
@@ -380,6 +385,7 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
       }
       else if( (isMeterAplus || isMeterAminus) && pos == 4 && type == 5 ) {  // scale
         scale = *(int64_t *)data;
+        itron->detailed = (scale == 3) ? false : true;  // scale == 3: coarse kWh readings after power failure
       }
       else if( pos == 5 ) {  // SML value
         if( isMeterId && type == 0 ) {  // meter id
@@ -533,6 +539,7 @@ void sml_data( char *data, size_t len ) {
   read_sml(&itron, data, 0xffff, 0);
   if( itron.valid == 0x3f ) {
     recv_time = time(NULL);
+    recv_detailed = itron.detailed;
   }
 
   count++;
@@ -540,7 +547,12 @@ void sml_data( char *data, size_t len ) {
     count = 0;
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
       post_data();
-      syslog.logf(LOG_INFO, "Itron %s", itronString(&itron));
+      if( recv_detailed ) {
+        syslog.logf(LOG_INFO, "Itron %s", itronString(&itron));
+      }
+      else {
+        syslog.logf(LOG_WARNING, "Itron %s", itronString(&itron));
+      }
     }
     else {
       syslog.logf(LOG_NOTICE, "Sml[%u]=%s", len, to_hex(data, len, ','));
