@@ -5,7 +5,7 @@ Receive messages from IR serial interface and post them on syslog and influx
 ## Hardware
 
 * Wemos Mini D1 ESP8266
-* IR LED (940nm?) as receiver
+* IR LED (940nm) as receiver
 * NPN transistor (e.g. BC546)
 
 ```
@@ -13,6 +13,9 @@ GND -- -_LED_+ -- NPN_B
 GND -- E_NPN_C -- R_10k -- V_3.3
 NPN_C -- GPIO_Rx
 ```
+## Grafana Dashboard
+
+![image](https://user-images.githubusercontent.com/32450554/144090837-7f8b4929-afb0-4e72-8f90-9dfbef6aee2a.png)
 
 ## SML Messages
 ```
