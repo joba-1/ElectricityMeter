@@ -15,7 +15,7 @@ NPN_C -- GPIO_Rx
 ```
 ## Grafana Dashboard
 
-![image](https://user-images.githubusercontent.com/32450554/144090837-7f8b4929-afb0-4e72-8f90-9dfbef6aee2a.png)
+![image](https://user-images.githubusercontent.com/32450554/144091536-94630249-3fab-48d6-807d-f92a7e7a44a1.png)
 
 ## SML Messages
 ```
