@@ -109,6 +109,43 @@ void post_data() {
   };
 }
 
+const char *main_page() {
+  // Standard page
+  static const char fmt[] =
+      "<html>\n"
+      " <head>\n"
+      "  <title>" PROGNAME " v" VERSION "</title>\n"
+      "  <meta http-equiv=\"expires\" content=\"5\">\n"
+      " </head>\n"
+      " <body>\n"
+      "  <h1>" PROGNAME " v" VERSION "</h1>\n"
+      "  <table><tr>\n"
+      "   <td><form action=\"json\">\n"
+      "    <input type=\"submit\" name=\"json\" value=\"JSON\" />\n"
+      "   </form></td>\n"
+      "   <td><form action=\"sml\">\n"
+      "    <input type=\"submit\" name=\"sml\" value=\"SML\" />\n"
+      "   </form></td>\n"
+      "   <td><form action=\"reset\" method=\"post\">\n"
+      "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
+      "   </form></td>\n"
+      "  </tr></table>\n"
+      "  <div>Post firmware image to /update<div>\n"
+      "  <div>Influx status: %d<div>\n"
+      "  <div>Detailed info: %s<div>\n"
+      "  <div>Last update: %s<div>\n"
+      " </body>\n"
+      "</html>\n";
+  static char page[sizeof(fmt) + 50] = "";
+  static char curr_time[30];
+  time_t now;
+  time(&now);
+  strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
+  snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
+           curr_time);
+  return page;
+}
+
 // Define web pages for update, reset or for event infos
 void setup_webserver() {
   web_server.on("/json", []() {
@@ -161,43 +198,14 @@ void setup_webserver() {
     ESP.restart();
   });
 
-  // Standard page
-  static const char fmt[] =
-      "<html>\n"
-      " <head>\n"
-      "  <title>" PROGNAME " v" VERSION "</title>\n"
-      "  <meta http-equiv=\"expires\" content=\"5\">\n"
-      " </head>\n"
-      " <body>\n"
-      "  <h1>" PROGNAME " v" VERSION "</h1>\n"
-      "  <table><tr>\n"
-      "   <td><form action=\"json\">\n"
-      "    <input type=\"submit\" name=\"json\" value=\"JSON\" />\n"
-      "   </form></td>\n"
-      "   <td><form action=\"sml\">\n"
-      "    <input type=\"submit\" name=\"sml\" value=\"SML\" />\n"
-      "   </form></td>\n"
-      "   <td><form action=\"reset\" method=\"post\">\n"
-      "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
-      "   </form></td>\n"
-      "  </tr></table>\n"
-      "  <div>Post firmware image to /update<div>\n"
-      "  <div>Influx status: %d<div>\n"
-      "  <div>Detailed info: %s<div>\n"
-      " </body>\n"
-      "</html>\n";
-  static char page[sizeof(fmt) + 10] = "";
-
   // Index page
   web_server.on("/", []() {
-    snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no");
-    web_server.send(200, "text/html", page);
+    web_server.send(200, "text/html", main_page());
   });
 
   // Catch all page
   web_server.onNotFound([]() {
-    snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no");
-    web_server.send(404, "text/html", page);
+    web_server.send(404, "text/html", main_page());
   });
 
   web_server.begin();
