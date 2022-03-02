@@ -130,7 +130,7 @@ void setup_webserver() {
                               "  \"aminus\": %llu\n"
                               " }\n"
                               "}\n";
-    static char msg[sizeof(fmt) + 2 * 20 + 5 * 10];
+    static char msg[sizeof(fmt) + 3 * 22 + 30 + 4 * 10];
     static char inf_time[30];
     static char rec_time[30];
     strftime(inf_time, sizeof(inf_time), "%FT%T%Z", localtime(&post_time));
