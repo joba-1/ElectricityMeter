@@ -112,14 +112,20 @@ void post_data() {
 const char *main_page() {
   // Standard page
   static const char fmt[] =
-      "<html>\n"
+      "<!doctype html>\n"
+      "<html lang=\"en\">\n"
       " <head>\n"
       "  <title>" PROGNAME " v" VERSION "</title>\n"
+      "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+      "  <meta charset=\"utf-8\">\n"
       "  <meta http-equiv=\"expires\" content=\"5\">\n"
       " </head>\n"
       " <body>\n"
       "  <h1>" PROGNAME " v" VERSION "</h1>\n"
       "  <table><tr>\n"
+      "   <td><form action=\"monitor\">\n"
+      "    <input type=\"submit\" name=\"monitor\" value=\"Monitor\" />\n"
+      "   </form></td>\n"
       "   <td><form action=\"json\">\n"
       "    <input type=\"submit\" name=\"json\" value=\"JSON\" />\n"
       "   </form></td>\n"
@@ -196,6 +202,40 @@ void setup_webserver() {
                     "</html>\n");
     delay(200);
     ESP.restart();
+  });
+
+  // Call this page to monitor power closely
+  web_server.on("/monitor", []() {
+    static const char fmt[] = 
+      "<!doctype html>\n"
+      "<html lang=\"en\">\n"
+      " <head>\n"
+      "  <title>" PROGNAME " v" VERSION "</title>\n"
+      "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+      "  <meta charset=\"utf-8\">\n"
+      "  <meta http-equiv=\"refresh\" content=\"2; url=/monitor\"> \n"
+      " </head>\n"
+      " <body><h1> " HOSTNAME " Monitor</h1><table>\n"
+      "  <tr><th align=\"right\">Power</th><th align=\"right\">Wh</th><th align=\"right\">W</th></tr>\n"
+      "  <tr><th align=\"right\">A+</th><td align=\"right\">%llu</td><td align=\"right\">%llu</td></tr>\n"
+      "  <tr><th align=\"right\">A-</th><td align=\"right\">%llu</td><td align=\"right\">%llu</td></tr>\n"
+      " </table></body>\n"
+      "</html>\n";
+    static char msg[sizeof(fmt) + 4 * 20];
+    static uint32_t uptime = 0;
+    static uint64_t aPlus = 0;
+    static uint64_t aMinus = 0;
+    static uint64_t aPlusW = 0;
+    static uint64_t aMinusW = 0;
+    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus - aMinus) ) {
+      aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
+      aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+      uptime = itron.uptime;
+      aPlus = itron.aPlus;
+      aMinus= itron.aMinus;
+    }
+    snprintf(msg, sizeof(msg), fmt, itron.aPlus, aPlusW, itron.aMinus, aMinusW);
+    web_server.send(200, "text/html", msg);
   });
 
   // Index page
