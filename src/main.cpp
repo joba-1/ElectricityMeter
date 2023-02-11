@@ -375,6 +375,7 @@ uint64_t pow10( uint64_t val, int8_t exp ) {
 Parse relevant data from Itron 3.Hz meter
  itron: pointer to structure with relevant values
  level: list level
+ pos:   in current sml value structure
  type:  data type (0, 4, 5, 6 from SML)
  data:  data of given type or 0 for end marker
  */
@@ -433,7 +434,9 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
       }
       else if( (isMeterAplus || isMeterAminus) && pos == 4 && type == 5 ) {  // scale
         scale = *(int64_t *)data;
-        itron->detailed = (scale == 3) ? false : true;  // scale == 3: coarse kWh readings after power failure
+        // scale ==  3: coarse kWh readings after power failure
+        // scale == -1: fine 1/10Wh readings (needs itr pin and menu setting)
+        itron->detailed = (scale == 3) ? false : true;
       }
       else if( pos == 5 ) {  // SML value
         if( isMeterId && type == 0 ) {  // meter id
@@ -447,7 +450,7 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
           isMeterSerial = false;
         }
         else if( isMeterAplus && type == 6 ) {  // A+ value
-          if( unit == 30 ) { // expecting [Wh]
+          if( unit == 30 ) {  // expecting [Wh]
             itron->aPlus = pow10(*(uint64_t *)data, scale);
             itron->valid |= 16;
           }
@@ -456,7 +459,7 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
           isMeterAplus = false;
         }
         else if( isMeterAminus && type == 6 ) {  // A- value
-          if( unit == 30 ) { // expecting [Wh]
+          if( unit == 30 ) {  // expecting [Wh]
             itron->aMinus = pow10(*(uint64_t *)data, scale);
             itron->valid |= 32;
           }
