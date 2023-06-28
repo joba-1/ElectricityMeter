@@ -17,6 +17,12 @@ NPN_C -- GPIO_Rx
 
 ![image](https://user-images.githubusercontent.com/32450554/144091536-94630249-3fab-48d6-807d-f92a7e7a44a1.png)
 
+## WLED Status
+
+Enabled if WLED_LEDS is #defined
+If there is either a very high power consumption or power is fed back to the grid, switch on a color coded wled via UDP packets
+Uses the WLED protocol DRGB
+
 ## SML Messages
 ```
 //0 1   2   3   4   5  level   
