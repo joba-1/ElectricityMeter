@@ -109,6 +109,64 @@ void post_data() {
   };
 }
 
+#ifdef WLED_LEDS
+WiFiUDP wledUDP;
+
+void send_wled() {
+  static uint32_t uptime = 0;
+  static uint64_t aPlus = 0;
+  static uint64_t aMinus = 0;
+  
+  uint64_t aPlusW = 0;
+  uint64_t aMinusW = 0;
+
+  if( itron.valid == 0x3f ) {
+    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
+      if( uptime ) {
+        aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
+        aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+      }
+      
+      uptime = itron.uptime;
+      aPlus = itron.aPlus;
+      aMinus = itron.aMinus;
+
+      // 1 step = 1 Watt, rgb colors from yellow to green to blue
+      uint8_t r = 0, g = 0, b = 0;
+      if( aPlusW > 4000 ) {
+        r = 0xff, b = 0x22;  // red warning on high load
+      }
+      else if( aMinusW > 800 ) {
+        r = 0x22, b = 0xff;  // warning color
+      }
+      else if( aMinusW >= (800-255) ) {
+        g = (800 - aMinusW); b = 0xff;  // very high back feed: blue with diminishing green
+      }
+      else if( aMinusW >= (800-255-255) ) {
+        g = 0xff, b = aMinusW - (800-255-255);  // high back feed: green with increasing blue
+      }
+      else if( aMinusW >= (800-255-255-200) ) {
+        r = (800-255-255) - aMinusW; g = 0xff;  // low back feed: yellow green with decreasing red
+      }
+      
+      // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
+
+      if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
+        wledUDP.write(2);  // WLED proto DRGB
+        wledUDP.write(3);  // hold color for 3 seconds
+        int led = WLED_LEDS;
+        while( led-- ) {
+          wledUDP.write(r);
+          wledUDP.write(g);
+          wledUDP.write(b);
+        }
+        wledUDP.endPacket();
+      }
+    }
+  }
+}
+#endif
+
 const char *main_page() {
   // Standard page
   static const char fmt[] =
@@ -227,9 +285,11 @@ void setup_webserver() {
     static uint64_t aMinus = 0;
     static uint64_t aPlusW = 0;
     static uint64_t aMinusW = 0;
-    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus - aMinus) ) {
-      aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
-      aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
+      if( uptime ) {
+        aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
+        aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+      }
       uptime = itron.uptime;
       aPlus = itron.aPlus;
       aMinus= itron.aMinus;
@@ -301,6 +361,22 @@ void setup() {
 
   esp_updater.setup(&web_server);
   setup_webserver();
+
+  // Test wled status info
+  // itron.valid = 0x3f;
+  // for( uint16_t w = 0; w < 900; w++ ) {
+  //   itron.uptime += 3600;
+  //   itron.aMinus += w;
+  //   send_wled();
+  //   delay(50);
+  // }
+  // itron.uptime += 3600;
+  // itron.aPlus += 5000;
+  // send_wled();
+  // itron.uptime = 0;
+  // itron.aPlus = 0;
+  // itron.aMinus = 0;
+  // itron.valid = 0x0;
 
   last_counter_reset = millis();
 }
@@ -610,6 +686,10 @@ void sml_data( char *data, size_t len ) {
       syslog.logf(LOG_NOTICE, "Itron invalid: %s", itronString(&itron));
     }
   }
+
+  #ifdef WLED_LEDS
+  send_wled();
+  #endif
 }
 
 typedef enum { MODE_NONE, MODE_START, MODE_VER, MODE_DATA, MODE_END, MODE_FINISH } read_mode_t;
