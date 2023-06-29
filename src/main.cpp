@@ -61,8 +61,8 @@ typedef struct itron_3hz {
   char serial[10];
   uint64_t file;
   uint32_t uptime;
-  uint64_t aPlus;
-  uint64_t aMinus;
+  uint64_t aPlus;  // now 1/10 Wh
+  uint64_t aMinus; // now 1/10 Wh
   bool detailed;
 } itron_3hz_t;
 
@@ -91,7 +91,7 @@ void post_data() {
   char fmt[] = "energy,meter=%s watt=%llu,watt_out=%llu\n";
   char msg[sizeof(fmt) + 30 + 2 * 10];
   char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
-  snprintf(msg, sizeof(msg), fmt, serial, itron.aPlus, itron.aMinus);
+  snprintf(msg, sizeof(msg), fmt, serial, (itron.aPlus+5)/10, (itron.aMinus+5)/10);
 
   http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
   http.setUserAgent(PROGNAME);
@@ -116,6 +116,7 @@ void send_wled() {
   static uint32_t uptime = 0;
   static uint64_t aPlus = 0;
   static uint64_t aMinus = 0;
+  static bool isOn = false;  // on at 90W, off at 0W
   
   uint64_t aPlusW = 0;
   uint64_t aMinusW = 0;
@@ -123,37 +124,40 @@ void send_wled() {
   if( itron.valid == 0x3f ) {
     if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
       if( uptime ) {
-        aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
-        aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+        aPlusW = (itron.aPlus - aPlus) * 360 / (itron.uptime - uptime);
+        aMinusW = (itron.aMinus - aMinus) * 360 / (itron.uptime - uptime);
       }
       
       uptime = itron.uptime;
       aPlus = itron.aPlus;
       aMinus = itron.aMinus;
 
-      // 1 step = 1 Watt, rgb colors from yellow to green to blue
       uint8_t r = 0, g = 0, b = 0;
       if( aPlusW > 4000 ) {
         r = 0xff, b = 0x22;  // red warning on high load
+        isOn = false;
       }
       else if( aMinusW > 800 ) {
-        r = 0x22, b = 0xff;  // warning color
+        b = 0xff;  // too high back feed: blue
+        isOn = true;
       }
-      else if( aMinusW >= (800-255) ) {
-        g = (800 - aMinusW); b = 0xff;  // very high back feed: blue with diminishing green
+      else if( aMinusW > 600 ) {
+        g = 0xff; b = 0xff;  // very high back feed: cyan
+        isOn = true;
       }
-      else if( aMinusW >= (800-255-255) ) {
-        g = 0xff, b = aMinusW - (800-255-255);  // high back feed: green with increasing blue
+      else if( (isOn and (aPlusW == 0 || aMinusW > 0)) || aMinusW > 100 ) {
+        g = 0xff; // good back feed: green
+        isOn = true;
       }
-      else if( aMinusW >= (800-255-255-200) ) {
-        r = (800-255-255) - aMinusW; g = 0xff;  // low back feed: yellow green with decreasing red
+      else {
+        isOn = false;
       }
       
       // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
 
       if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
         wledUDP.write(2);  // WLED proto DRGB
-        wledUDP.write(3);  // hold color for 3 seconds
+        wledUDP.write(5);  // hold color for 5 seconds
         int led = WLED_LEDS;
         while( led-- ) {
           wledUDP.write(r);
@@ -227,8 +231,8 @@ void setup_webserver() {
                               "  \"serial\": \"%s\",\n"
                               "  \"detailed\": \"%s\",\n"
                               "  \"uptime\": %u,\n"
-                              "  \"aplus\": %llu,\n"
-                              "  \"aminus\": %llu\n"
+                              "  \"aplus\": %.1f,\n"
+                              "  \"aminus\": %.1f\n"
                               " }\n"
                               "}\n";
     static char msg[sizeof(fmt) + 3 * 22 + 30 + 4 * 10];
@@ -238,7 +242,7 @@ void setup_webserver() {
     strftime(rec_time, sizeof(rec_time), "%FT%T%Z", localtime(&recv_time));
     char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
     snprintf(msg, sizeof(msg), fmt, start_time, inf_time, rec_time,
-             itron.id, serial, recv_detailed ? "yes" : "no", itron.uptime, itron.aPlus, itron.aMinus);
+             itron.id, serial, recv_detailed ? "yes" : "no", itron.uptime, itron.aPlus/10.0, itron.aMinus/10.0);
     web_server.send(200, "application/json", msg);
   });
 
@@ -275,16 +279,16 @@ void setup_webserver() {
       " </head>\n"
       " <body><h1> " HOSTNAME " Monitor</h1><table>\n"
       "  <tr><th align=\"right\">Power</th><th align=\"right\">Wh</th><th align=\"right\">W</th></tr>\n"
-      "  <tr><th align=\"right\">A+</th><td align=\"right\">%llu</td><td align=\"right\">%llu</td></tr>\n"
-      "  <tr><th align=\"right\">A-</th><td align=\"right\">%llu</td><td align=\"right\">%llu</td></tr>\n"
+      "  <tr><th align=\"right\">A+</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
+      "  <tr><th align=\"right\">A-</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
       " </table></body>\n"
       "</html>\n";
     static char msg[sizeof(fmt) + 4 * 20];
     static uint32_t uptime = 0;
     static uint64_t aPlus = 0;
     static uint64_t aMinus = 0;
-    static uint64_t aPlusW = 0;
-    static uint64_t aMinusW = 0;
+    static uint64_t aPlusW = 0;   // now 1/10W
+    static uint64_t aMinusW = 0;  // now 1/10W
     if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
       if( uptime ) {
         aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
@@ -294,7 +298,7 @@ void setup_webserver() {
       aPlus = itron.aPlus;
       aMinus= itron.aMinus;
     }
-    snprintf(msg, sizeof(msg), fmt, itron.aPlus, aPlusW, itron.aMinus, aMinusW);
+    snprintf(msg, sizeof(msg), fmt, itron.aPlus/10.0, aPlusW/10.0, itron.aMinus/10.0, aMinusW/10.0);
     web_server.send(200, "text/html", msg);
   });
 
@@ -427,8 +431,8 @@ char *itronString( itron_3hz_t *itron ) {
   serial[sizeof(itron->serial) * 3 - 1] = '\0'; // cut last separator 
 
   snprintf(msg, sizeof(msg), 
-    "valid[0x3f]=0x%02x, detailed=%s, id='%3.3s', serial='%s', record=%llu, uptime[s]=%u, A+[Wh]=%llu, A-[Wh]=%llu",
-    itron->valid, itron->detailed ? "true" : "false", itron->id, serial, itron->file, itron->uptime, itron->aPlus, itron->aMinus);
+    "valid[0x3f]=0x%02x, detailed=%s, id='%3.3s', serial='%s', record=%llu, uptime[s]=%u, A+[Wh]=%.1f, A-[Wh]=%.1f",
+    itron->valid, itron->detailed ? "true" : "false", itron->id, serial, itron->file, itron->uptime, itron->aPlus/10.0, itron->aMinus/10.0);
 
   return msg;
 }
@@ -527,7 +531,7 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
         }
         else if( isMeterAplus && type == 6 ) {  // A+ value
           if( unit == 30 ) {  // expecting [Wh]
-            itron->aPlus = pow10(*(uint64_t *)data, scale);
+            itron->aPlus = pow10(*(uint64_t *)data, scale+1);
             itron->valid |= 16;
           }
           unit = 0;
@@ -536,7 +540,7 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
         }
         else if( isMeterAminus && type == 6 ) {  // A- value
           if( unit == 30 ) {  // expecting [Wh]
-            itron->aMinus = pow10(*(uint64_t *)data, scale);
+            itron->aMinus = pow10(*(uint64_t *)data, scale+1);
             itron->valid |= 32;
           }
           unit = 0;
