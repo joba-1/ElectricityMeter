@@ -116,6 +116,7 @@ void send_wled() {
   static uint32_t uptime = 0;
   static uint64_t aPlus = 0;
   static uint64_t aMinus = 0;
+  static bool isOn = false;  // on at 90W, off at 0W
   
   uint64_t aPlusW = 0;
   uint64_t aMinusW = 0;
@@ -123,37 +124,40 @@ void send_wled() {
   if( itron.valid == 0x3f ) {
     if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
       if( uptime ) {
-        aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
-        aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
+        aPlusW = (itron.aPlus - aPlus) * 360 / (itron.uptime - uptime);
+        aMinusW = (itron.aMinus - aMinus) * 360 / (itron.uptime - uptime);
       }
       
       uptime = itron.uptime;
       aPlus = itron.aPlus;
       aMinus = itron.aMinus;
 
-      // 1 step = 1 Watt, rgb colors from yellow to green to blue
       uint8_t r = 0, g = 0, b = 0;
       if( aPlusW > 4000 ) {
         r = 0xff, b = 0x22;  // red warning on high load
+        isOn = false;
       }
       else if( aMinusW > 800 ) {
-        r = 0x22, b = 0xff;  // warning color
+        b = 0xff;  // too high back feed: blue
+        isOn = true;
       }
-      else if( aMinusW >= (800-255) ) {
-        g = (800 - aMinusW); b = 0xff;  // very high back feed: blue with diminishing green
+      else if( aMinusW > 600 ) {
+        g = 0xff; b = 0xff;  // very high back feed: cyan
+        isOn = true;
       }
-      else if( aMinusW >= (800-255-255) ) {
-        g = 0xff, b = aMinusW - (800-255-255);  // high back feed: green with increasing blue
+      else if( (isOn and (aPlusW == 0 || aMinusW > 0)) || aMinusW > 100 ) {
+        g = 0xff; // good back feed: green
+        isOn = true;
       }
-      else if( aMinusW >= (800-255-255-200) ) {
-        r = (800-255-255) - aMinusW; g = 0xff;  // low back feed: yellow green with decreasing red
+      else {
+        isOn = false;
       }
       
       // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
 
       if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
         wledUDP.write(2);  // WLED proto DRGB
-        wledUDP.write(3);  // hold color for 3 seconds
+        wledUDP.write(5);  // hold color for 5 seconds
         int led = WLED_LEDS;
         while( led-- ) {
           wledUDP.write(r);
@@ -283,8 +287,8 @@ void setup_webserver() {
     static uint32_t uptime = 0;
     static uint64_t aPlus = 0;
     static uint64_t aMinus = 0;
-    static uint64_t aPlusW = 0;
-    static uint64_t aMinusW = 0;
+    static uint64_t aPlusW = 0;   // now 1/10W
+    static uint64_t aMinusW = 0;  // now 1/10W
     if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
       if( uptime ) {
         aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
