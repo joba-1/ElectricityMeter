@@ -111,6 +111,11 @@ void post_data() {
 
 #ifdef WLED_LEDS
 WiFiUDP wledUDP;
+const uint8_t wled_secs = 5;
+uint8_t wled_r = 0;
+uint8_t wled_g = 0;
+uint8_t wled_b = 0;
+uint32_t wled_update = 0;
 
 void send_wled() {
   static uint32_t uptime = 0;
@@ -157,7 +162,7 @@ void send_wled() {
 
       if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
         wledUDP.write(2);  // WLED proto DRGB
-        wledUDP.write(5);  // hold color for 5 seconds
+        wledUDP.write(wled_secs);  // hold color for some seconds
         int led = WLED_LEDS;
         while( led-- ) {
           wledUDP.write(r);
@@ -165,6 +170,10 @@ void send_wled() {
           wledUDP.write(b);
         }
         wledUDP.endPacket();
+        wled_r = r;
+        wled_g = g;
+        wled_b = b;
+        wled_update = millis();
       }
     }
   }
@@ -201,6 +210,9 @@ const char *main_page() {
       "  <div>Post firmware image to /update<div>\n"
       "  <div>Influx status: %d<div>\n"
       "  <div>Detailed info: %s<div>\n"
+      #ifdef WLED_LEDS
+        "  <div>WLED status: %06x since %u seconds<div>\n"
+      #endif
       "  <div>Last update: %s<div>\n"
       " </body>\n"
       "</html>\n";
@@ -209,7 +221,20 @@ const char *main_page() {
   time_t now;
   time(&now);
   strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
+  #ifdef WLED_LEDS
+  uint32_t now_ms = millis();
+  if( (wled_r || wled_g || wled_b) && wled_update && (now_ms - wled_update) >= wled_secs * 1000 ) {
+    wled_update += wled_secs * 1000;
+    wled_r = 0;
+    wled_g = 0;
+    wled_b = 0;
+  }
+  #endif
   snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
+  #ifdef WLED_LEDS
+           (wled_r << 16) + (wled_g << 8) + wled_b,
+           (now_ms - wled_update) / 1000,
+  #endif
            curr_time);
   return page;
 }
