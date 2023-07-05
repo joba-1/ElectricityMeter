@@ -112,6 +112,9 @@ void post_data() {
 #ifdef WLED_LEDS
 WiFiUDP wledUDP;
 const uint8_t wled_secs = 5;
+// Consider enabling wled setting "Force max brightness" to be independent from wled master brightness
+const uint8_t wled_brightness = WLED_BRIGHTNESS;  // 0..255
+// only for display on web page
 uint8_t wled_r = 0;
 uint8_t wled_g = 0;
 uint8_t wled_b = 0;
@@ -121,7 +124,7 @@ void send_wled() {
   static uint32_t uptime = 0;
   static uint64_t aPlus = 0;
   static uint64_t aMinus = 0;
-  static bool isOn = false;  // on at 90W, off at 0W
+  static bool isOn = false;  // for on/off hysteresis
   
   uint64_t aPlusW = 0;
   uint64_t aMinusW = 0;
@@ -158,6 +161,12 @@ void send_wled() {
         isOn = false;
       }
       
+      if( isOn ) {
+        r = (uint16_t)wled_brightness * r / 255;
+        g = (uint16_t)wled_brightness * g / 255;
+        b = (uint16_t)wled_brightness * b / 255;
+      }
+
       // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
 
       if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
