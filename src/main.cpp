@@ -118,7 +118,8 @@ const uint8_t wled_brightness = WLED_BRIGHTNESS;  // 0..255
 uint8_t wled_r = 0;
 uint8_t wled_g = 0;
 uint8_t wled_b = 0;
-uint32_t wled_update = 0;
+uint32_t wled_update = 0;  // ms of last udp packet
+uint32_t wled_change = 0;  // ms of last color change
 
 void send_wled() {
   static uint32_t uptime = 0;
@@ -179,10 +180,13 @@ void send_wled() {
           wledUDP.write(b);
         }
         wledUDP.endPacket();
-        wled_r = r;
-        wled_g = g;
-        wled_b = b;
         wled_update = millis();
+        if( wled_r != r || wled_g != g || wled_b != b ) {
+          wled_change = wled_update;
+          wled_r = r;
+          wled_g = g;
+          wled_b = b;
+        }
       }
     }
   }
@@ -232,8 +236,8 @@ const char *main_page() {
   strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
   #ifdef WLED_LEDS
   uint32_t now_ms = millis();
-  if( (wled_r || wled_g || wled_b) && wled_update && (now_ms - wled_update) >= wled_secs * 1000 ) {
-    wled_update += wled_secs * 1000;
+  if( (wled_r || wled_g || wled_b) && (now_ms - wled_update) >= (wled_secs * 1000) ) {
+    wled_change += wled_secs * 1000;
     wled_r = 0;
     wled_g = 0;
     wled_b = 0;
@@ -242,7 +246,7 @@ const char *main_page() {
   snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
   #ifdef WLED_LEDS
            (wled_r << 16) + (wled_g << 8) + wled_b,
-           (now_ms - wled_update) / 1000,
+           (now_ms - wled_change) / 1000,
   #endif
            curr_time);
   return page;
