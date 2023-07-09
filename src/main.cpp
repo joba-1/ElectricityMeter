@@ -180,6 +180,97 @@ void send_wled() {
 }
 #endif
 
+#ifdef DTU_TOPIC
+#include <PubSubClient.h>
+
+WiFiClient wifiMqtt;
+PubSubClient mqtt(wifiMqtt);
+uint16_t curr_limit = UINT16_MAX;
+
+void publish_limit( uint16_t limit ) {
+  char payload[10];
+  snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
+  if( !mqtt.connected() || !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload)) {
+    syslog.log(LOG_ERR, "Mqtt publish failed");
+  }
+}
+
+void check_limit() {
+  const uint16_t max_limit = 800;
+  const uint16_t min_aMinus = 200;
+  const uint16_t max_aMinus = 400;
+  
+  static uint32_t uptime = 0;
+  static uint64_t aPlus = 0;
+  static uint64_t aMinus = 0;
+  
+  uint64_t aMinusW = 0;
+
+  if( itron.valid == 0x3f ) {
+    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
+      if( uptime ) {
+        aMinusW = (itron.aMinus - aMinus) * 360 / (itron.uptime - uptime);
+      }
+      
+      uptime = itron.uptime;
+      aPlus = itron.aPlus;
+      aMinus = itron.aMinus;
+
+      if( curr_limit != UINT16_MAX ) {
+        if( aMinusW > max_aMinus && curr_limit > 0 ) {
+          uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
+          publish_limit((curr_limit > delta) ? curr_limit - delta : 0);
+        }
+        else if( aMinusW < min_aMinus && curr_limit < max_limit ) {
+          uint16_t delta = (min_aMinus + max_aMinus)/2 - aMinusW;
+          publish_limit((curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
+        }
+      }
+    }
+  }
+}
+
+// Called on incoming mqtt limit_absolute messages
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  char *endp;
+  char *str = (char *)payload;
+  if( length > 0 ) {
+    unsigned long limit = strtoul(str, &endp, 10);
+    if( endp != str && limit < UINT16_MAX ) {
+      curr_limit = ((limit + 50) / 100) * 100;
+    }
+  }
+}
+
+void handle_mqtt() {
+  static const int32_t interval = 5000;  // if disconnected try reconnect this often in ms
+  static uint32_t prev = -interval;      // first connect attempt without delay
+  static char msg[128];
+
+  if (mqtt.connected()) {
+    mqtt.loop();
+  }
+
+  uint32_t now = millis();
+  if (now - prev > interval) {
+    prev = now;
+
+    if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
+      && mqtt.publish(HOSTNAME "/LWT", "Online", true)
+      && mqtt.publish(HOSTNAME "/Version", VERSION, true)
+      && mqtt.subscribe(DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute")) {
+      snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
+      syslog.log(LOG_NOTICE, msg);
+    }
+
+    int error = mqtt.state();
+    mqtt.disconnect();
+    snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%d failed with code %d", MQTT_BROKER, MQTT_PORT, error);
+    syslog.log(LOG_ERR, msg);
+  }
+}
+#endif
+
 const char *main_page() {
   // Standard page
   static const char fmt[] =
@@ -210,6 +301,9 @@ const char *main_page() {
       "  <div>Post firmware image to /update<div>\n"
       "  <div>Influx status: %d<div>\n"
       "  <div>Detailed info: %s<div>\n"
+      #ifdef DTU_TOPIC
+        "  <div>Inverter limit: %u W<div>\n"
+      #endif
       #ifdef WLED_LEDS
         "  <div>WLED status: %06x since %u seconds<div>\n"
       #endif
@@ -231,6 +325,9 @@ const char *main_page() {
   }
   #endif
   snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
+  #ifdef DTU_TOPIC
+        curr_limit,
+  #endif
   #ifdef WLED_LEDS
            (wled_r << 16) + (wled_g << 8) + wled_b,
            (now_ms - wled_update) / 1000,
@@ -390,6 +487,11 @@ void setup() {
 
   esp_updater.setup(&web_server);
   setup_webserver();
+
+#ifdef DTU_TOPIC
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(mqtt_callback);
+#endif
 
   // Test wled status info
   // itron.valid = 0x3f;
@@ -716,6 +818,10 @@ void sml_data( char *data, size_t len ) {
     }
   }
 
+  #ifdef DTU_TOPIC
+  check_limit();
+  #endif
+
   #ifdef WLED_LEDS
   send_wled();
   #endif
@@ -825,6 +931,10 @@ void loop() {
   if( smlRead ) {
     read_serial_sml();
   }
+
+#ifdef DTU_TOPIC
+  handle_mqtt();
+#endif
 
   web_server.handleClient();
   delay(1);
