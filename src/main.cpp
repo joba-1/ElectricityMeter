@@ -200,11 +200,14 @@ WiFiClient wifiMqtt;
 PubSubClient mqtt(wifiMqtt);
 uint16_t curr_limit = UINT16_MAX;
 
-void publish_limit( uint16_t limit ) {
+void publish_limit( uint64_t prod, uint16_t limit ) {
   char payload[10];
   snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
   if( !mqtt.connected() || !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload)) {
     syslog.log(LOG_ERR, "Mqtt publish failed");
+  }
+  else {
+    syslog.logf(LOG_INFO, "Producing %llu W -> change nonpersistent limit from %u to %s W", prod, curr_limit, payload);
   }
 }
 
@@ -232,11 +235,11 @@ void check_limit() {
       if( curr_limit != UINT16_MAX ) {
         if( aMinusW > max_aMinus && curr_limit > 0 ) {
           uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
-          publish_limit((curr_limit > delta) ? curr_limit - delta : 0);
+          publish_limit(aMinusW, (curr_limit > delta) ? curr_limit - delta : 0);
         }
         else if( aMinusW < min_aMinus && curr_limit < max_limit ) {
           uint16_t delta = (min_aMinus + max_aMinus)/2 - aMinusW;
-          publish_limit((curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
+          publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
         }
       }
     }
