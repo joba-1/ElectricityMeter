@@ -112,16 +112,20 @@ void post_data() {
 #ifdef WLED_LEDS
 WiFiUDP wledUDP;
 const uint8_t wled_secs = 5;
+// Consider enabling wled setting "Force max brightness" to be independent from wled master brightness
+const uint8_t wled_brightness = WLED_BRIGHTNESS;  // 0..255
+// only for display on web page
 uint8_t wled_r = 0;
 uint8_t wled_g = 0;
 uint8_t wled_b = 0;
-uint32_t wled_update = 0;
+uint32_t wled_update = 0;  // ms of last udp packet
+uint32_t wled_change = 0;  // ms of last color change
 
 void send_wled() {
   static uint32_t uptime = 0;
   static uint64_t aPlus = 0;
   static uint64_t aMinus = 0;
-  static bool isOn = false;  // on at 90W, off at 0W
+  static bool isOn = false;  // for on/off hysteresis
   
   uint64_t aPlusW = 0;
   uint64_t aMinusW = 0;
@@ -158,6 +162,12 @@ void send_wled() {
         isOn = false;
       }
       
+      if( isOn ) {
+        r = (uint16_t)wled_brightness * r / 255;
+        g = (uint16_t)wled_brightness * g / 255;
+        b = (uint16_t)wled_brightness * b / 255;
+      }
+
       // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
 
       if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
@@ -170,10 +180,13 @@ void send_wled() {
           wledUDP.write(b);
         }
         wledUDP.endPacket();
-        wled_r = r;
-        wled_g = g;
-        wled_b = b;
         wled_update = millis();
+        if( wled_r != r || wled_g != g || wled_b != b ) {
+          wled_change = wled_update;
+          wled_r = r;
+          wled_g = g;
+          wled_b = b;
+        }
       }
     }
   }
@@ -317,8 +330,8 @@ const char *main_page() {
   strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
   #ifdef WLED_LEDS
   uint32_t now_ms = millis();
-  if( (wled_r || wled_g || wled_b) && wled_update && (now_ms - wled_update) >= wled_secs * 1000 ) {
-    wled_update += wled_secs * 1000;
+  if( (wled_r || wled_g || wled_b) && (now_ms - wled_update) >= (wled_secs * 1000) ) {
+    wled_change += wled_secs * 1000;
     wled_r = 0;
     wled_g = 0;
     wled_b = 0;
@@ -330,7 +343,7 @@ const char *main_page() {
   #endif
   #ifdef WLED_LEDS
            (wled_r << 16) + (wled_g << 8) + wled_b,
-           (now_ms - wled_update) / 1000,
+           (now_ms - wled_change) / 1000,
   #endif
            curr_time);
   return page;
