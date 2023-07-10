@@ -198,8 +198,10 @@ void send_wled() {
 
 WiFiClient wifiMqtt;
 PubSubClient mqtt(wifiMqtt);
+const char topic_name[] = DTU_TOPIC "/" INVERTER_SERIAL "/name";
 const char topic_limit[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
 const char topic_reachable[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/reachable";
+char inverter[80] = "?";  
 uint16_t curr_limit = UINT16_MAX;
 bool reachable = false;
 
@@ -207,10 +209,10 @@ void publish_limit( uint64_t prod, uint16_t limit ) {
   char payload[10];
   snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
   if( !mqtt.connected() || !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload)) {
-    syslog.log(LOG_ERR, "Mqtt publish failed");
+    syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
   }
   else {
-    syslog.logf(LOG_INFO, "Producing %llu W -> change nonpersistent limit from %u to %s W", prod, curr_limit, payload);
+    syslog.logf(LOG_INFO, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
   }
 }
 
@@ -253,7 +255,11 @@ void check_limit() {
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic_reachable, topic) == 0) {
     if( length > 0 ) {
-      reachable = payload[0] != '0';
+      bool flag = payload[0] != '0';
+      if( flag != reachable ) {
+          syslog.logf(LOG_NOTICE, "Inverter '%s' is %s", inverter, flag ? "reachable" : "unreachable");
+          reachable = flag;
+      }
     }
   }
   else if (strcmp(topic_limit, topic) == 0) {
@@ -262,7 +268,21 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if( length > 0 ) {
       unsigned long limit = strtoul(str, &endp, 10);
       if( endp != str && limit < UINT16_MAX ) {
-        curr_limit = ((limit + 50) / 100) * 100;
+        limit = ((limit + 50) / 100) * 100;
+        if( limit != curr_limit ) {
+          syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %u W", inverter, limit);
+          curr_limit = limit;
+        }
+      }
+    }
+  }
+  else if (strcmp(topic_name, topic) == 0) {
+    if( length > 0 ) {
+      size_t len = min((size_t)sizeof(inverter)-1, length);
+      if( len != strlen(inverter) || strncmp(inverter, (char *)payload, len)) {
+        strncpy(inverter, (char *)payload, len);
+        inverter[len] = '\0';
+        syslog.logf(LOG_NOTICE, "Inverter name is '%s'", inverter);
       }
     }
   }
@@ -287,8 +307,9 @@ void handle_mqtt() {
       if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
       && mqtt.publish(HOSTNAME "/LWT", "Online", true)
       && mqtt.publish(HOSTNAME "/Version", VERSION, true)
+      && mqtt.subscribe(topic_reachable)
       && mqtt.subscribe(topic_limit)
-      && mqtt.subscribe(topic_reachable)) {
+      && mqtt.subscribe(topic_name)) {
         snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
         syslog.log(LOG_NOTICE, msg);
       }
@@ -334,7 +355,7 @@ const char *main_page() {
       "  <div>Influx status: %d<div>\n"
       "  <div>Detailed info: %s<div>\n"
       #ifdef DTU_TOPIC
-        "  <div>Inverter limit: %u W<div>\n"
+        "  <div>Inverter '%s' limit: %u W<div>\n"
       #endif
       #ifdef WLED_LEDS
         "  <div>WLED status: %06x since %u seconds<div>\n"
@@ -358,7 +379,8 @@ const char *main_page() {
   #endif
   snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
   #ifdef DTU_TOPIC
-        curr_limit,
+           inverter,
+           curr_limit,
   #endif
   #ifdef WLED_LEDS
            (wled_r << 16) + (wled_g << 8) + wled_b,
