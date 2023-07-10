@@ -1,6 +1,8 @@
 # Energy Meter Gateway with ESP8266
 
-Receive messages from IR serial interface and post them on syslog and influx
+* Receive messages from IR serial interface and post them on syslog and influx database
+* Optionally send power status (feeding to grid or high load) to WLED with UDP
+* Optionally set limit of an OpenDTU inverter via MQTT to avoid high feed to grid
 
 ## Hardware
 
@@ -22,6 +24,12 @@ NPN_C -- GPIO_Rx
 Enabled if WLED_LEDS is #defined
 If there is either a very high power consumption or power is fed back to the grid, switch on a color coded wled via UDP packets
 Uses the WLED protocol DRGB
+
+## Set OpenDTU Inverter Limit
+
+Enabled if DTU_TOPIC is #defined (Topic must match what you used in your OpenDTU firmware). Also set INVERTER_SERIAL, e.g. by adapting inverter_template.ini to your inverters serial.
+If enabled, it will try to avoid high backfeed to the grid by adjusting the OpenDTU production power limit of your inverter.
+Seems to work fine with my TSOL-M800. Should work with all inverters where you can adjust the limit with MQTT topic DTU_TOPIC/INVERTER_SERIAL/cmd/limit_nonpersistent_absolute.
 
 ## SML Messages
 ```
