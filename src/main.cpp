@@ -198,7 +198,10 @@ void send_wled() {
 
 WiFiClient wifiMqtt;
 PubSubClient mqtt(wifiMqtt);
+const char topic_limit[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
+const char topic_reachable[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/reachable";
 uint16_t curr_limit = UINT16_MAX;
+bool reachable = false;
 
 void publish_limit( uint64_t prod, uint16_t limit ) {
   char payload[10];
@@ -232,7 +235,7 @@ void check_limit() {
       aPlus = itron.aPlus;
       aMinus = itron.aMinus;
 
-      if( curr_limit != UINT16_MAX ) {
+      if( curr_limit != UINT16_MAX && reachable ) {
         if( aMinusW > max_aMinus && curr_limit > 0 ) {
           uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
           publish_limit(aMinusW, (curr_limit > delta) ? curr_limit - delta : 0);
@@ -248,13 +251,23 @@ void check_limit() {
 
 // Called on incoming mqtt limit_absolute messages
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  char *endp;
-  char *str = (char *)payload;
-  if( length > 0 ) {
-    unsigned long limit = strtoul(str, &endp, 10);
-    if( endp != str && limit < UINT16_MAX ) {
-      curr_limit = ((limit + 50) / 100) * 100;
+  if (strcmp(topic_reachable, topic) == 0) {
+    if( length > 0 ) {
+      reachable = payload[0] != '0';
     }
+  }
+  else if (strcmp(topic_limit, topic) == 0) {
+    char *endp;
+    char *str = (char *)payload;
+    if( length > 0 ) {
+      unsigned long limit = strtoul(str, &endp, 10);
+      if( endp != str && limit < UINT16_MAX ) {
+        curr_limit = ((limit + 50) / 100) * 100;
+      }
+    }
+  }
+  else {
+    syslog.logf(LOG_ERR, "Unknown topic '%s'", topic);
   }
 }
 
@@ -274,7 +287,8 @@ void handle_mqtt() {
       if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
       && mqtt.publish(HOSTNAME "/LWT", "Online", true)
       && mqtt.publish(HOSTNAME "/Version", VERSION, true)
-      && mqtt.subscribe(DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute")) {
+      && mqtt.subscribe(topic_limit)
+      && mqtt.subscribe(topic_reachable)) {
         snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
         syslog.log(LOG_NOTICE, msg);
       }
