@@ -205,9 +205,16 @@ char inverter[80] = "?";
 uint16_t curr_limit = UINT16_MAX;
 bool reachable = false;
 
+/*
+Send MQTT request to change power limit
+Limit is rounded to full 100W  
+*/
 void publish_limit( uint64_t prod, uint16_t limit ) {
+  syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
+
   char payload[10];
   snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
+
   if( !mqtt.connected() || !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload)) {
     syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
   }
@@ -216,38 +223,50 @@ void publish_limit( uint64_t prod, uint16_t limit ) {
   }
 }
 
+/*
+If feed to the grid is outside of a given range, adjust inverter limit to be as close as possible in the center of that range
+*/
 void check_limit() {
   const uint16_t max_limit = 800;
   const uint16_t min_aMinus = 200;
   const uint16_t max_aMinus = 400;
   
   static uint32_t uptime = 0;
-  static uint64_t aPlus = 0;
   static uint64_t aMinus = 0;
   
   uint64_t aMinusW = 0;
 
-  if( itron.valid == 0x3f ) {
-    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
-      if( uptime ) {
-        aMinusW = (itron.aMinus - aMinus) * 360 / (itron.uptime - uptime);
-      }
-      
-      uptime = itron.uptime;
-      aPlus = itron.aPlus;
-      aMinus = itron.aMinus;
+  static uint32_t update_ms = 0;
 
-      if( curr_limit != UINT16_MAX && reachable ) {
+  if( itron.valid == 0x3f ) {
+    if( uptime && uptime != itron.uptime ) {
+      uint32_t delta_t = itron.uptime - uptime;
+      aMinusW = (itron.aMinus - aMinus) * 360 / delta_t;
+      syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
+    
+      uint32_t now = millis();
+      if( curr_limit != UINT16_MAX && reachable && (now - update_ms) > 30000 ) {
         if( aMinusW > max_aMinus && curr_limit > 0 ) {
+          update_ms = now;
           uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
           publish_limit(aMinusW, (curr_limit > delta) ? curr_limit - delta : 0);
         }
         else if( aMinusW < min_aMinus && curr_limit < max_limit ) {
+          update_ms = now;
           uint16_t delta = (min_aMinus + max_aMinus)/2 - aMinusW;
           publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
         }
+        else {
+          syslog.logf(LOG_INFO, "Check: current limit %u W not changed for prod %llu W", curr_limit, aMinusW);
+        }
+      }
+      else {
+        syslog.logf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
       }
     }
+
+    uptime = itron.uptime;
+    aMinus = itron.aMinus;
   }
 }
 
@@ -270,7 +289,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       if( endp != str && limit < UINT16_MAX ) {
         limit = ((limit + 50) / 100) * 100;
         if( limit != curr_limit ) {
-          syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %u W", inverter, limit);
+          syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %lu W", inverter, limit);
           curr_limit = limit;
         }
       }
