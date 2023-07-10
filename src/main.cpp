@@ -266,23 +266,25 @@ void handle_mqtt() {
   if (mqtt.connected()) {
     mqtt.loop();
   }
+  else {
+    uint32_t now = millis();
+    if (now - prev > interval) {
+      prev = now;
 
-  uint32_t now = millis();
-  if (now - prev > interval) {
-    prev = now;
-
-    if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
+      if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
       && mqtt.publish(HOSTNAME "/LWT", "Online", true)
       && mqtt.publish(HOSTNAME "/Version", VERSION, true)
       && mqtt.subscribe(DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute")) {
-      snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
-      syslog.log(LOG_NOTICE, msg);
+        snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
+        syslog.log(LOG_NOTICE, msg);
+      }
+      else {
+        int error = mqtt.state();
+        mqtt.disconnect();
+        snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%d failed with code %d", MQTT_BROKER, MQTT_PORT, error);
+        syslog.log(LOG_ERR, msg);
+      }
     }
-
-    int error = mqtt.state();
-    mqtt.disconnect();
-    snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%d failed with code %d", MQTT_BROKER, MQTT_PORT, error);
-    syslog.log(LOG_ERR, msg);
   }
 }
 #endif
