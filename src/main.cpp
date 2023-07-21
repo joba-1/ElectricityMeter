@@ -198,28 +198,33 @@ void send_wled() {
 
 WiFiClient wifiMqtt;
 PubSubClient mqtt(wifiMqtt);
-const char topic_name[] = DTU_TOPIC "/" INVERTER_SERIAL "/name";
-const char topic_limit[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
+const char topic_name[] =      DTU_TOPIC "/" INVERTER_SERIAL "/name";
+const char topic_limit[] =     DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
 const char topic_reachable[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/reachable";
+const char topic_dynamic[] =   DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_dynamic";
 char inverter[80] = "?";  
 uint16_t curr_limit = UINT16_MAX;
 bool reachable = false;
+bool dynamic = false;
 
 /*
 Send MQTT request to change power limit
 Limit is rounded to full 100W  
 */
 void publish_limit( uint64_t prod, uint16_t limit ) {
-  syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
+  /// syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
 
   char payload[10];
   snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
 
-  if( !mqtt.connected() || !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload)) {
+  if( !mqtt.connected() || (dynamic && !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload))) {
     syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
   }
+  else if (dynamic) {
+    syslog.logf(LOG_NOTICE, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
+  }
   else {
-    syslog.logf(LOG_INFO, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
+    syslog.logf(LOG_NOTICE, "Producing %llu W -> no change of limit for inverter '%s' from %u to %s W due to topic '%s' is not 1", prod, inverter, curr_limit, payload, topic_dynamic);
   }
 }
 
@@ -242,7 +247,7 @@ void check_limit() {
     if( uptime && uptime != itron.uptime ) {
       uint32_t delta_t = itron.uptime - uptime;
       aMinusW = (itron.aMinus - aMinus) * 360 / delta_t;
-      syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
+      /// syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
     
       uint32_t now = millis();
       if( curr_limit != UINT16_MAX && reachable && (now - update_ms) > 30000 ) {
@@ -257,11 +262,11 @@ void check_limit() {
           publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
         }
         else {
-          syslog.logf(LOG_INFO, "Check: current limit %u W not changed for prod %llu W", curr_limit, aMinusW);
+          /// syslog.logf(LOG_INFO, "Check: current limit %u W not changed for prod %llu W", curr_limit, aMinusW);
         }
       }
       else {
-        syslog.logf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
+        /// syslog.logf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
       }
     }
 
@@ -305,6 +310,16 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       }
     }
   }
+  else if (strcmp(topic_dynamic, topic) == 0) {
+    bool flag = false;
+    if( length > 0 ) {
+      flag = payload[0] == '1';
+    }
+    if( flag != dynamic ) {
+        syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %s", inverter, flag ? "dynamic" : "static");
+        dynamic = flag;
+    }
+  }
   else {
     syslog.logf(LOG_ERR, "Unknown topic '%s'", topic);
   }
@@ -328,6 +343,7 @@ void handle_mqtt() {
       && mqtt.publish(HOSTNAME "/Version", VERSION, true)
       && mqtt.subscribe(topic_reachable)
       && mqtt.subscribe(topic_limit)
+      && mqtt.subscribe(topic_dynamic)
       && mqtt.subscribe(topic_name)) {
         snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
         syslog.log(LOG_NOTICE, msg);
@@ -374,7 +390,7 @@ const char *main_page() {
       "  <div>Influx status: %d<div>\n"
       "  <div>Detailed info: %s<div>\n"
       #ifdef DTU_TOPIC
-        "  <div>Inverter '%s' limit: %u W<div>\n"
+        "  <div>Inverter '%s' limit: %s %u W<div>\n"
       #endif
       #ifdef WLED_LEDS
         "  <div>WLED status: %06x since %u seconds<div>\n"
@@ -399,6 +415,7 @@ const char *main_page() {
   snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
   #ifdef DTU_TOPIC
            inverter,
+           dynamic ? "dynamic" : "static",
            curr_limit,
   #endif
   #ifdef WLED_LEDS
