@@ -23,15 +23,19 @@ NPN_C -- GPIO_Rx
 
 Enabled if WLED_LEDS is #defined
 If there is either a very high power consumption or power is fed back to the grid, switch on a color coded wled via UDP packets
-Uses the WLED protocol DRGB
+Uses the WLED protocol DRGB.
+The wled status can be seen on the main web page.
 
-## Set OpenDTU Inverter Limit
+## Dynamic OpenDTU Inverter Limit
 
-Enabled if DTU_TOPIC is #defined (Topic must match what you used in your OpenDTU firmware). Also set INVERTER_SERIAL, e.g. by adapting inverter_template.ini to your inverters serial.
+Enabled if DTU_TOPIC is #defined (Topic must match what you used in your OpenDTU firmware). Also set INVERTER_SERIAL, e.g. by adapting inverter_template.ini to your inverters serial and set MQTT topic DTU_TOPIC/INVERTER_SERIAL/status/limit_dynamic to 1.
+
 If enabled, it will try to avoid high backfeed to the grid by adjusting the OpenDTU production power limit of your inverter.
 Seems to work fine with my TSOL-M800. Should work with all inverters where you can adjust the limit with MQTT topic DTU_TOPIC/INVERTER_SERIAL/cmd/limit_nonpersistent_absolute.
+The status of the dynamic limit can be seen on the main web page.
 
 ## SML Messages
+Example message from my itron electricity meter
 ```
 //0 1   2   3   4   5  level   
 76,
