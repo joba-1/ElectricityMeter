@@ -88,7 +88,7 @@ char *to_hex( char *buf, size_t len, char sep ) {
 void post_data() {
   static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
 
-  char fmt[] = "energy,meter=%s watt=%llu,watt_out=%llu\n";
+  const char fmt[] = "energy,meter=%s watt=%llu,watt_out=%llu\n";
   char msg[sizeof(fmt) + 30 + 2 * 10];
   char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
   snprintf(msg, sizeof(msg), fmt, serial, (itron.aPlus+5)/10, (itron.aMinus+5)/10);
@@ -272,6 +272,29 @@ void check_limit() {
 
     uptime = itron.uptime;
     aMinus = itron.aMinus;
+  }
+}
+
+// send current power consumption or production to mqtt
+void publish_data() {
+  static uint64_t lastAPlusW = 0;
+  static uint64_t lastAMinusW = 0;
+
+  uint64_t aPlusW = (itron.aPlus + 5) / 10;
+  uint64_t aMinusW = (itron.aMinus + 5) / 10;
+
+  if( aPlusW != lastAPlusW ) {
+    char wh[20];
+    snprintf(wh, sizeof(wh), "%llu", aPlusW);
+    mqtt.publish(HOSTNAME "/Wh_In", wh);
+    lastAPlusW = aPlusW;
+  }
+
+  if( aMinusW != lastAMinusW ) {
+    char wh[20];
+    snprintf(wh, sizeof(wh), "%llu", aMinusW);
+    mqtt.publish(HOSTNAME "/Wh_Out", wh);
+    lastAMinusW = aMinusW;
   }
 }
 
@@ -895,6 +918,9 @@ void sml_data( char *data, size_t len ) {
     count = 0;
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
       post_data();
+      #ifdef DTU_TOPIC
+      publish_data();
+      #endif
       if( recv_detailed ) {
         syslog.logf(LOG_INFO, "Itron %s", itronString(&itron));
       }
