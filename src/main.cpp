@@ -208,23 +208,30 @@ bool reachable = false;
 bool dynamic = false;
 
 /*
-Send MQTT request to change power limit
+Send MQTT request to change power limit if it changed
 Limit is rounded to full 100W  
 */
 void publish_limit( uint64_t prod, uint16_t limit ) {
   /// syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
 
-  char payload[10];
-  snprintf(payload, sizeof(payload), "%u", ((limit + 50) / 100) * 100);
+  limit = ((limit + 50) / 100) * 100;  // round new limit to 100W
 
-  if( !mqtt.connected() || (dynamic && !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload))) {
-    syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
-  }
-  else if (dynamic) {
-    syslog.logf(LOG_NOTICE, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
+  if( limit != curr_limit ) {
+    char payload[10];
+    snprintf(payload, sizeof(payload), "%u", limit);
+
+    if( !mqtt.connected() || (dynamic && !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload))) {
+      syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
+    }
+    else if (dynamic) {
+      syslog.logf(LOG_NOTICE, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
+    }
+    else {
+      syslog.logf(LOG_NOTICE, "Producing %llu W -> no change of limit for inverter '%s' from %u to %s W due to topic '%s' is not 1", prod, inverter, curr_limit, payload, topic_dynamic);
+    }
   }
   else {
-    syslog.logf(LOG_NOTICE, "Producing %llu W -> no change of limit for inverter '%s' from %u to %s W due to topic '%s' is not 1", prod, inverter, curr_limit, payload, topic_dynamic);
+      syslog.logf(LOG_NOTICE, "Producing %llu W -> rounded limit for inverter '%s' of %u W still the same", prod, inverter, curr_limit);
   }
 }
 
@@ -235,9 +242,15 @@ void check_limit() {
 #ifndef INVERTER_LIMIT
 #define INVERTER_LIMIT 600
 #endif
+#ifndef BACKFEED_MIN
+#define BACKFEED_MIN 200
+#endif
+#ifndef BACKFEED_MAX
+#define BACKFEED_MAX 500
+#endif
   const uint16_t max_limit = INVERTER_LIMIT;  // unthrottled WR while backfeed is small enough
-  const uint16_t min_aMinus = 200;
-  const uint16_t max_aMinus = 400;
+  const uint16_t min_aMinus = BACKFEED_MIN;   // if actual backfeed is lower, inverter gets less limited 
+  const uint16_t max_aMinus = BACKFEED_MAX;   // if actual backfeed is higher, inverter gets more limited
   
   static uint32_t uptime = 0;
   static uint64_t aMinus = 0;
@@ -247,20 +260,30 @@ void check_limit() {
   static uint32_t update_ms = 0;
 
   if( itron.valid == 0x3f ) {
+    // we have valid backfeed data
     if( uptime && uptime != itron.uptime ) {
+      // and data was updated since last check
       uint32_t delta_t = itron.uptime - uptime;
+      // calculate average backfeed in W from the ever increasing backfeed counter
+      // and the elapsed time since last check
       aMinusW = (itron.aMinus - aMinus) * 360 / delta_t;
       /// syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
     
       uint32_t now = millis();
       if( curr_limit != UINT16_MAX && reachable && (now - update_ms) > 30000 ) {
+        // only try to change the limit if the current limit is known 
+        // and the inverter is reachable and the last change is more than 30s ago
         if( aMinusW > max_aMinus && curr_limit > 0 ) {
+          // current backfeed is too high and inverter is not yet fully limited
           update_ms = now;
+          // change of inverter limit to backfeed right in the middle of the desired range
           uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
           publish_limit(aMinusW, (curr_limit > delta) ? curr_limit - delta : 0);
         }
         else if( aMinusW < min_aMinus && curr_limit < max_limit ) {
+          // current backfeed is too low and inverter is not yet fully opened
           update_ms = now;
+          // change of inverter limit to backfeed right in the middle of the desired range
           uint16_t delta = (min_aMinus + max_aMinus)/2 - aMinusW;
           publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
         }
