@@ -251,38 +251,34 @@ void check_limit() {
   const uint16_t max_limit = INVERTER_LIMIT;  // unthrottled WR while backfeed is small enough
   const uint16_t min_aMinus = BACKFEED_MIN;   // if actual backfeed is lower, inverter gets less limited 
   const uint16_t max_aMinus = BACKFEED_MAX;   // if actual backfeed is higher, inverter gets more limited
-  
+  const uint16_t min_check_delay_s = 10;      // high enough to make power calc from counter reliable
+                                              // low enough to limit time with too high backfeed
   static uint32_t uptime = 0;
   static uint64_t aMinus = 0;
   
   uint64_t aMinusW = 0;
 
-  static uint32_t update_ms = 0;
-
   if( itron.valid == 0x3f ) {
     // we have valid backfeed data
-    if( uptime && uptime != itron.uptime ) {
-      // and data was updated since last check
-      uint32_t delta_t = itron.uptime - uptime;
+    uint32_t delta_t = itron.uptime - uptime;
+    if( uptime && delta_t > min_check_delay_s ) {
+      // the last check is more than min_check_delay_s ago
       // calculate average backfeed in W from the ever increasing backfeed counter
       // and the elapsed time since last check
       aMinusW = (itron.aMinus - aMinus) * 360 / delta_t;
       /// syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
     
-      uint32_t now = millis();
-      if( curr_limit != UINT16_MAX && reachable && (now - update_ms) > 30000 ) {
+      if( curr_limit != UINT16_MAX && reachable ) {
         // only try to change the limit if the current limit is known 
-        // and the inverter is reachable and the last change is more than 30s ago
+        // and the inverter is reachable
         if( aMinusW > max_aMinus && curr_limit > 0 ) {
           // current backfeed is too high and inverter is not yet fully limited
-          update_ms = now;
           // change of inverter limit to backfeed right in the middle of the desired range
           uint16_t delta = aMinusW - (min_aMinus + max_aMinus)/2;
           publish_limit(aMinusW, (curr_limit > delta) ? curr_limit - delta : 0);
         }
         else if( aMinusW < min_aMinus && curr_limit < max_limit ) {
           // current backfeed is too low and inverter is not yet fully opened
-          update_ms = now;
           // change of inverter limit to backfeed right in the middle of the desired range
           uint16_t delta = (min_aMinus + max_aMinus)/2 - aMinusW;
           publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
@@ -294,10 +290,9 @@ void check_limit() {
       else {
         /// syslog.logf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
       }
+      uptime = itron.uptime;
+      aMinus = itron.aMinus;
     }
-
-    uptime = itron.uptime;
-    aMinus = itron.aMinus;
   }
 }
 
