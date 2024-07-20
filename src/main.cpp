@@ -232,7 +232,10 @@ void publish_limit( uint64_t prod, uint16_t limit ) {
 If feed to the grid is outside of a given range, adjust inverter limit to be as close as possible in the center of that range
 */
 void check_limit() {
-  const uint16_t max_limit = 800;
+#ifndef INVERTER_LIMIT
+#define INVERTER_LIMIT 600
+#endif
+  const uint16_t max_limit = INVERTER_LIMIT;  // unthrottled WR while backfeed is small enough
   const uint16_t min_aMinus = 200;
   const uint16_t max_aMinus = 400;
   
@@ -421,7 +424,7 @@ const char *main_page() {
       "  <div>Last update: %s<div>\n"
       " </body>\n"
       "</html>\n";
-  static char page[sizeof(fmt) + 50] = "";
+  static char page[sizeof(fmt) + 150] = "";
   static char curr_time[30];
   time_t now;
   time(&now);
