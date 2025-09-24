@@ -15,6 +15,7 @@
 #include <Syslog.h>
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
+#include <SoftwareSerial.h>
 
 #ifndef PWMRANGE
 #define PWMRANGE 1023
@@ -29,6 +30,8 @@
 #define DB_LED_OFF HIGH
 
 #define WEBSERVER_PORT 80
+
+SoftwareSerial mirror(NOT_A_PIN, IR_LED_PIN, true);  // TX only
 
 ESP8266WebServer web_server(WEBSERVER_PORT);
 
@@ -533,7 +536,7 @@ void setup_webserver() {
       "  <meta charset=\"utf-8\">\n"
       "  <meta http-equiv=\"refresh\" content=\"2; url=/monitor\"> \n"
       " </head>\n"
-      " <body><h1> " HOSTNAME " Monitor</h1><table>\n"
+      " <body><h1> " HOSTNAME " Monitor v" VERSION "</h1><table>\n"
       "  <tr><th align=\"right\">Power</th><th align=\"right\">Wh</th><th align=\"right\">W</th></tr>\n"
       "  <tr><th align=\"right\">A+</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
       "  <tr><th align=\"right\">A-</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
@@ -584,6 +587,8 @@ void setup() {
 
   Serial.begin(SERIAL_SPEED);
   Serial.println("\nStarting " PROGNAME " v" VERSION " " __DATE__ " " __TIME__);
+
+  mirror.begin(SERIAL_SPEED, EspSoftwareSerial::SWSERIAL_8N1, -1, IR_LED_PIN, true);
 
   // Syslog setup
   syslog.server(SYSLOG_SERVER, SYSLOG_PORT);
@@ -968,13 +973,16 @@ typedef enum { MODE_NONE, MODE_START, MODE_VER, MODE_DATA, MODE_END, MODE_FINISH
 
 void read_serial_sml() {
   static char data[2560];  // enough for 2s at 9600 baud
+  static unsigned char buff[2560];  // copy for mirror
   // static char raw[1024];
   static read_mode_t mode = MODE_NONE;
   static size_t count = 0;
+  static size_t pos = 0;  // buff position
   // static size_t len = 0;
   int ch;
 
   while( (ch = Serial.read()) >= 0 ) {
+    buff[pos++] = ch;
     // if( len ) {
     //   raw[len++] = ch;
     // }
@@ -1003,6 +1011,10 @@ void read_serial_sml() {
         }
         else {
           //syslog.logf(LOG_INFO, "START->NONE");
+          if (pos) {
+            mirror.write(buff, pos);
+            pos = 0;
+          }
           mode = MODE_NONE;
         }
         break;
@@ -1016,6 +1028,10 @@ void read_serial_sml() {
           }
         } else {
           //syslog.logf(LOG_INFO, "VER->NONE");
+          if (pos) {
+            mirror.write(buff, pos);
+            pos = 0;
+          }
           mode = MODE_NONE;
         }
         break;
@@ -1043,6 +1059,10 @@ void read_serial_sml() {
           sml_data(data, count);
         }
         //syslog.logf(LOG_INFO, "FINISH->NONE");
+        if (pos) {
+          mirror.write(buff, pos);
+          pos = 0;
+        }
         mode = MODE_NONE;
         break;
     }
