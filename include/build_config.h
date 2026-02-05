@@ -51,6 +51,22 @@
 #define WLED_PORT 21324
 #endif
 
+#ifndef WLED_CONSUMPTION_HIGH
+#define WLED_CONSUMPTION_HIGH 4000
+#endif
+
+#ifndef WLED_BACKFEED_TOO_HIGH
+#define WLED_BACKFEED_TOO_HIGH 99999
+#endif
+
+#ifndef WLED_BACKFEED_VERY_HIGH
+#define WLED_BACKFEED_VERY_HIGH 99999
+#endif
+
+#ifndef WLED_BACKFEED_GOOD
+#define WLED_BACKFEED_GOOD 200
+#endif
+
 #ifndef MQTT_BROKER
 #define MQTT_BROKER "job4"
 #endif
@@ -68,11 +84,19 @@
 #endif
 
 #ifndef BACKFEED_MIN
-#define BACKFEED_MIN 200
+#define BACKFEED_MIN 5000
 #endif
 
 #ifndef BACKFEED_MAX
 #define BACKFEED_MAX 5000
+#endif
+
+#ifndef LIMIT_CHECK_INTERVAL_S
+#define LIMIT_CHECK_INTERVAL_S 10
+#endif
+
+#ifndef LIMIT_ROUND_GRANULARITY
+#define LIMIT_ROUND_GRANULARITY 100
 #endif
 
 #ifndef PROD_KW_MAX

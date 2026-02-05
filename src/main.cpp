@@ -148,19 +148,19 @@ void send_wled() {
       aMinus = itron.aMinus;
 
       uint8_t r = 0, g = 0, b = 0;
-      if( aPlusW > 4000 ) {
+      if( aPlusW > WLED_CONSUMPTION_HIGH ) {
         r = 0xff, b = 0x22;  // red warning on high load
         isOn = false;
       }
-      else if( aMinusW > 800 ) {
+      else if( aMinusW > WLED_BACKFEED_TOO_HIGH ) {
         b = 0xff;  // too high back feed: blue
         isOn = true;
       }
-      else if( aMinusW > 600 ) {
+      else if( aMinusW > WLED_BACKFEED_VERY_HIGH ) {
         g = 0xff; b = 0xff;  // very high back feed: cyan
         isOn = true;
       }
-      else if( (isOn and (aPlusW == 0 || aMinusW > 0)) || aMinusW > 100 ) {
+      else if( (isOn and (aPlusW == 0 || aMinusW > 0)) || aMinusW > WLED_BACKFEED_GOOD ) {
         g = 0xff; // good back feed: green
         isOn = true;
       }
@@ -220,7 +220,7 @@ Limit is rounded to full 100W
 void publish_limit( uint64_t prod, uint16_t limit ) {
   /// syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
 
-  limit = ((limit + 50) / 100) * 100;  // round new limit to 100W
+  limit = ((limit + LIMIT_ROUND_GRANULARITY/2) / LIMIT_ROUND_GRANULARITY) * LIMIT_ROUND_GRANULARITY;  // round limit
 
   if( limit != curr_limit ) {
     char payload[10];
@@ -248,8 +248,8 @@ void check_limit() {
   const uint16_t max_limit = INVERTER_LIMIT;  // unthrottled WR while backfeed is small enough
   const uint16_t min_aMinus = BACKFEED_MIN;   // if actual backfeed is lower, inverter gets less limited 
   const uint16_t max_aMinus = BACKFEED_MAX;   // if actual backfeed is higher, inverter gets more limited
-  const uint16_t min_check_delay_s = 10;      // high enough to make power calc from counter reliable
-                                              // low enough to limit time with too high backfeed
+  const uint16_t min_check_delay_s = LIMIT_CHECK_INTERVAL_S;  // high enough to make power calc from counter reliable
+                                                              // low enough to limit time with too high backfeed
   static uint32_t uptime = 0;
   static uint64_t aMinus = 0;
   
@@ -333,7 +333,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if( length > 0 ) {
       unsigned long limit = strtoul(str, &endp, 10);
       if( endp != str && limit < UINT16_MAX ) {
-        limit = ((limit + 50) / 100) * 100;
+        limit = ((limit + LIMIT_ROUND_GRANULARITY/2) / LIMIT_ROUND_GRANULARITY) * LIMIT_ROUND_GRANULARITY;
         if( limit != curr_limit ) {
           syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %lu W", inverter, limit);
           curr_limit = limit;
