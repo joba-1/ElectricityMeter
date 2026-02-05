@@ -1023,83 +1023,55 @@ typedef enum { MODE_NONE, MODE_START, MODE_VER, MODE_DATA, MODE_END, MODE_FINISH
 
 void read_serial_sml() {
   static char data[2560];  // enough for 2s at 9600 baud
-  static unsigned char buff[2560];  // copy for mirror
-  // static char raw[1024];
   static read_mode_t mode = MODE_NONE;
   static size_t count = 0;
-  static size_t pos = 0;  // buff position
-  // static size_t len = 0;
   int ch;
 
   while( (ch = Serial.read()) >= 0 ) {
-    buff[pos++] = ch;
-    // if( len ) {
-    //   raw[len++] = ch;
-    // }
+    // Mirror all incoming data to IR LED output
+    mirror.write(ch);
+    
     switch( mode ) {
       case MODE_NONE:
         if( ch == 0x1b ) {
           mode = MODE_START;
-          //syslog.logf(LOG_INFO, "NONE->START");
           count = 1;
-          // if( len ) {
-          //   syslog.logf(LOG_INFO, "Raw[%u]=%s", len-1, to_hex(raw, len-1));
-          //   len = 0;
-          // }
-          // else {
-          //   raw[len++] = ch;
-          // }
         }
         break;
       case MODE_START:
         if( ch == 0x1b ) {
           if( ++count == 4 ) {
             mode = MODE_VER;
-            //syslog.logf(LOG_INFO, "START->VER");
             count = 0;
           }
         }
         else {
-          //syslog.logf(LOG_INFO, "START->NONE");
-          if (pos) {
-            mirror.write(buff, pos);
-            pos = 0;
-          }
           mode = MODE_NONE;
         }
         break;
       case MODE_VER:
         if (ch == 0x01) {
           if (++count == 4) {
-            //syslog.logf(LOG_INFO, "VER->DATA");
             mode = MODE_DATA;
             counter_events++;  // reset inactivity counter
             count = 0;
           }
         } else {
-          //syslog.logf(LOG_INFO, "VER->NONE");
-          if (pos) {
-            mirror.write(buff, pos);
-            pos = 0;
-          }
           mode = MODE_NONE;
         }
         break;
       case MODE_DATA:
         data[count++] = ch;
         if( count % 4 == 1 && ch == 0x1b ) {
-          //syslog.logf(LOG_INFO, "DATA->END");
           mode = MODE_END;
         }
         break;
       case MODE_END:
         data[count++] = ch;
         if( count % 4 != 0 && ch != 0x1b ) {
-          //syslog.logf(LOG_INFO, "END->DATA");
           mode = MODE_DATA;
         }
         else if (count % 4 == 0 ) {
-          //syslog.logf(LOG_INFO, "END->FINISH");
           mode = MODE_FINISH;
           count -= 4;
         }
@@ -1107,11 +1079,6 @@ void read_serial_sml() {
       case MODE_FINISH:
         if (ch == 0x1a) {
           sml_data(data, count);
-        }
-        //syslog.logf(LOG_INFO, "FINISH->NONE");
-        if (pos) {
-          mirror.write(buff, pos);
-          pos = 0;
         }
         mode = MODE_NONE;
         break;
