@@ -1,8 +1,36 @@
 # Energy Meter Gateway with ESP8266
 
 * Receive messages from IR serial interface and post them on syslog and influx database
+* Validate meter readings against configured power limits to reject bogus data
 * Optionally send power status (feeding to grid or high load) to WLED with UDP
 * Optionally set limit of an OpenDTU inverter via MQTT to avoid high feed to grid
+
+## Features
+
+### Meter Reading Validation
+Readings are validated against configured maximum power thresholds (`PROD_KW_MAX`, `USAGE_KW_MAX`) to detect and reject anomalous data from the meter. If any reading exceeds the limits, the entire SML message is discarded as invalid.
+
+### WLED Visual Feedback
+Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).
+
+Color thresholds (configurable in platformio.ini):
+- **Red** - High consumption (> `WLED_CONSUMPTION_HIGH` W, default 4000 W)
+- **Blue** - Too high backfeed (> `WLED_BACKFEED_TOO_HIGH` W, default disabled)
+- **Cyan** - Very high backfeed (> `WLED_BACKFEED_VERY_HIGH` W, default disabled)
+- **Green** - Good backfeed (> `WLED_BACKFEED_GOOD` W, default 200 W)
+
+### Dynamic OpenDTU Inverter Limit
+Enabled if `DTU_TOPIC` is defined. Automatically adjusts the inverter power limit via MQTT to keep grid backfeed within a target range (`BACKFEED_MIN` to `BACKFEED_MAX`).
+
+**Note:** Set `BACKFEED_MIN` = `BACKFEED_MAX` to disable automatic limit adjustment (inverter runs at maximum).
+
+Configuration in platformio.ini:
+- `INVERTER_LIMIT` - Maximum inverter output (W)
+- `BACKFEED_MIN` / `BACKFEED_MAX` - Target backfeed range (W)
+- `LIMIT_CHECK_INTERVAL_S` - Minimum seconds between adjustments
+- `LIMIT_ROUND_GRANULARITY` - Round limit changes to multiples of this value (W)
+
+The MQTT topic format is: `DTU_TOPIC/INVERTER_SERIAL/cmd/limit_nonpersistent_absolute`
 
 ## Hardware
 
@@ -15,24 +43,51 @@ GND -- -_LED_+ -- NPN_B
 GND -- E_NPN_C -- R_10k -- V_3.3
 NPN_C -- GPIO_Rx
 ```
+
+## Building and Uploading
+
+```bash
+# Activate PlatformIO environment
+. ~/.platformio/penv/bin/activate
+
+# Build
+platformio run
+
+# Upload via OTA (requires hostname/instance configured)
+platformio run --target upload
+
+# Upload via USB
+# Set upload_port in platformio.ini first
+platformio run --target upload --upload-port /dev/ttyUSB0
+```
 ## Grafana Dashboard
 
 ![image](https://user-images.githubusercontent.com/32450554/144091536-94630249-3fab-48d6-807d-f92a7e7a44a1.png)
 
-## WLED Status
+## Configuration
 
-Enabled if WLED_LEDS is #defined
-If there is either a very high power consumption or power is fed back to the grid, switch on a color coded wled via UDP packets
-Uses the WLED protocol DRGB.
-The wled status can be seen on the main web page.
+All power limits and thresholds are configurable in `platformio.ini` under the `[program]` section:
 
-## Dynamic OpenDTU Inverter Limit
+```ini
+# Meter reading validation (reject bogus readings)
+prod_kw_max = 15          # Max production/feed-in power (kW)
+usage_kw_max = 20         # Max consumption power (kW)
 
-Enabled if DTU_TOPIC is #defined (Topic must match what you used in your OpenDTU firmware). Also set INVERTER_SERIAL, e.g. by adapting inverter_template.ini to your inverters serial and set MQTT topic DTU_TOPIC/INVERTER_SERIAL/status/limit_dynamic to 1.
+# WLED visual feedback thresholds (in W)
+wled_consumption_high = 4000     # Red warning
+wled_backfeed_too_high = 99999   # Blue (disabled by default)
+wled_backfeed_very_high = 99999  # Cyan (disabled by default)
+wled_backfeed_good = 200         # Green
 
-If enabled, it will try to avoid high backfeed to the grid by adjusting the OpenDTU production power limit of your inverter.
-Seems to work fine with my TSOL-M800. Should work with all inverters where you can adjust the limit with MQTT topic DTU_TOPIC/INVERTER_SERIAL/cmd/limit_nonpersistent_absolute.
-The status of the dynamic limit can be seen on the main web page.
+# Inverter control
+inverter_limit = 800             # Max inverter output (W)
+backfeed_min = 5000              # Target backfeed range min (W)
+backfeed_max = 5000              # Target backfeed range max (W) - set equal to min to disable
+limit_check_interval_s = 10      # Min seconds between limit adjustments
+limit_round_granularity = 100    # Round limits to multiples of this (W)
+```
+
+Copy `inverter_template.ini` to `inverter.ini` and set your inverter serial number.
 
 ## SML Messages
 Example message from my itron electricity meter
