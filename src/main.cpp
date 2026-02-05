@@ -1,5 +1,8 @@
 #include <Arduino.h>
 
+// defaults, can be overridden by platformio.ini build_flags
+#include "build_config.h"
+
 // Web Updater
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266WebServer.h>
@@ -242,15 +245,6 @@ void publish_limit( uint64_t prod, uint16_t limit ) {
 If feed to the grid is outside of a given range, adjust inverter limit to be as close as possible in the center of that range
 */
 void check_limit() {
-#ifndef INVERTER_LIMIT
-#define INVERTER_LIMIT 600
-#endif
-#ifndef BACKFEED_MIN
-#define BACKFEED_MIN 200
-#endif
-#ifndef BACKFEED_MAX
-#define BACKFEED_MAX 500
-#endif
   const uint16_t max_limit = INVERTER_LIMIT;  // unthrottled WR while backfeed is small enough
   const uint16_t min_aMinus = BACKFEED_MIN;   // if actual backfeed is lower, inverter gets less limited 
   const uint16_t max_aMinus = BACKFEED_MAX;   // if actual backfeed is higher, inverter gets more limited
@@ -690,6 +684,24 @@ void breathe() {
 
 typedef enum { SML_NONE=0, SML_OPEN=0x0101, SML_LIST=0x0701, SML_CLOSE=0x0201 } sml_message_t;
 
+// Validate meter reading is within configured limits
+// Compares power calculated from energy delta against max thresholds
+// Returns false if power exceeds limits
+// A+ = consumption from grid (use USAGE_KW_MAX)
+// A- = production/feed-in to grid (use PROD_KW_MAX)
+bool is_power_valid( uint64_t current_reading_1_10Wh, uint64_t previous_reading_1_10Wh, uint32_t delta_time_s, bool is_aplus ) {
+  if( delta_time_s == 0 ) return true;  // skip validation on first reading
+  
+  // Calculate power in W from energy delta over time
+  // (reading1 - reading0) * (1/10 Wh) / time_h * 3600 = power_W
+  // = (reading1 - reading0) * 360 / time_s
+  uint64_t power_W = (current_reading_1_10Wh - previous_reading_1_10Wh) * 360 / delta_time_s;
+  
+  uint32_t max_power_W = is_aplus ? USAGE_KW_MAX * 1000 : PROD_KW_MAX * 1000;
+  
+  return power_W <= max_power_W;
+}
+
 char *itronString( itron_3hz_t *itron ) {
   static char msg[200];
 
@@ -928,6 +940,9 @@ char *read_sml( itron_3hz_t *itron, char *data, size_t items, size_t level ) {
 void sml_data( char *data, size_t len ) {
   static const uint32_t max_count = 60;  // send ~once per minute
   static uint32_t count = max_count;
+  static uint32_t last_uptime = 0;
+  static uint64_t last_aPlus = 0;
+  static uint64_t last_aMinus = 0;
 
   sml_len = min(len, (size_t)sizeof(sml_raw));
   memcpy(sml_raw, data, sml_len);
@@ -937,6 +952,41 @@ void sml_data( char *data, size_t len ) {
   if( itron.valid == 0x3f ) {
     recv_time = time(NULL);
     recv_detailed = itron.detailed;
+    
+    // Validate readings are within configured power limits
+    if( last_uptime > 0 ) {
+      uint32_t delta_time_s = itron.uptime - last_uptime;
+      if( delta_time_s > 0 ) {
+        bool valid = true;
+        // Check A+ (production)
+        if( itron.aPlus >= last_aPlus ) {
+          if( !is_power_valid(itron.aPlus, last_aPlus, delta_time_s, true) ) {
+            syslog.logf(LOG_WARNING, "Rejected reading: A+ delta=%llu in %u s exceeds PROD_KW_MAX=%u", 
+                        itron.aPlus - last_aPlus, delta_time_s, PROD_KW_MAX);
+            valid = false;
+          }
+        }
+        // Check A- (consumption)
+        if( itron.aMinus >= last_aMinus ) {
+          if( !is_power_valid(itron.aMinus, last_aMinus, delta_time_s, false) ) {
+            syslog.logf(LOG_WARNING, "Rejected reading: A- delta=%llu in %u s exceeds USAGE_KW_MAX=%u", 
+                        itron.aMinus - last_aMinus, delta_time_s, USAGE_KW_MAX);
+            valid = false;
+          }
+        }
+        // If any value is out of range, invalidate entire reading
+        if( !valid ) {
+          itron.valid = 0;
+        }
+      }
+    }
+    
+    // Store current values for next comparison (only if reading was valid)
+    if( itron.valid == 0x3f ) {
+      last_uptime = itron.uptime;
+      last_aPlus = itron.aPlus;
+      last_aMinus = itron.aMinus;
+    }
   }
 
   count++;
