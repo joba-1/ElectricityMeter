@@ -15,7 +15,7 @@ dark-themed nav bar:
 * `/monitor` – auto-refreshing live power plus consumption for today, yesterday, this/last
   week, month and year. On the first valid reading after boot the device queries InfluxDB
   for the meter value at-or-after the start of each period so consumption stays correct
-  across reboots; periods with no historical data fall back to the current reading.
+  across reboots; periods with no historical data show a dash.
 * `/json` – stable JSON API (unchanged across versions)
 * `/sml` – last raw SML record (binary download, unchanged)
 * `/update` – OTA firmware upload

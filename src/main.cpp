@@ -890,8 +890,7 @@ void setup_webserver() {
     web_server.sendContent_P(PSTR(
       "</table>"
       "<p class=\"muted\" style=\"font-size:.8rem\">"
-      "Period baselines are kept in RAM and reset on reboot; values "
-      "shown for ongoing periods grow until the next rollover."
+      "A dash (&mdash;) means no baseline value is available yet for that period."
       "</p></div>"));
 
     send_html_foot();
