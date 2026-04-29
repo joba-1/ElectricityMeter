@@ -580,14 +580,8 @@ void update_period_baselines() {
   last_year_idx  = year_idx;
 }
 
-void format_wh( char *buf, size_t bufsize, uint64_t one_tenth_wh ) {
-  double wh = one_tenth_wh / 10.0;
-  if( wh >= 1000.0 ) {
-    snprintf(buf, bufsize, "%.3f kWh", wh / 1000.0);
-  }
-  else {
-    snprintf(buf, bufsize, "%.1f Wh", wh);
-  }
+void format_kwh( char *buf, size_t bufsize, uint64_t one_tenth_wh ) {
+  snprintf(buf, bufsize, "%.3f", one_tenth_wh / 10000.0);
 }
 
 // Shared chunk of buffer for HTML composition (one HTTP request at a time)
@@ -683,22 +677,24 @@ void send_html_foot() {
   web_server.sendContent("");
 }
 
-void emit_period_row( const char *label, const period_t *cur, const period_t *base ) {
+void emit_period_row( const char *label, const char *id, const period_t *cur, const period_t *base ) {
   char in_buf[24]  = "&mdash;";
   char out_buf[24] = "&mdash;";
   if( cur->valid && base->valid && cur->aPlus >= base->aPlus ) {
-    format_wh(in_buf, sizeof(in_buf), cur->aPlus - base->aPlus);
+    format_kwh(in_buf, sizeof(in_buf), cur->aPlus - base->aPlus);
   }
   if( cur->valid && base->valid && cur->aMinus >= base->aMinus ) {
-    format_wh(out_buf, sizeof(out_buf), cur->aMinus - base->aMinus);
+    format_kwh(out_buf, sizeof(out_buf), cur->aMinus - base->aMinus);
   }
   snprintf(web_buf, sizeof(web_buf),
-    "<tr><th>%s</th><td>%s</td><td>%s</td></tr>", label, in_buf, out_buf);
+    "<tr><th>%s</th><td id=\"%s_in\">%s</td><td id=\"%s_out\">%s</td></tr>",
+    label, id, in_buf, id, out_buf);
   web_server.sendContent(web_buf);
 }
 
-// Compute instantaneous power (1/10 W) by tracking deltas between successive readings.
-// The static state is per-page so home and monitor each get a smooth value.
+// Smoothed live power tracker. Updated only on validated SML readings, and
+// only when the integration window is at least POWER_WINDOW_S seconds long
+// so quantization noise from 1/10 Wh deltas doesn't make the displayed W jump.
 struct power_state_t {
   uint32_t uptime;
   uint64_t aPlus;
@@ -707,40 +703,63 @@ struct power_state_t {
   uint64_t aMinusW;  // 1/10 W
 };
 
-void update_power( power_state_t *s ) {
-  if( s->uptime != itron.uptime && (itron.aPlus != s->aPlus || itron.aMinus != s->aMinus) ) {
-    if( s->uptime ) {
-      s->aPlusW  = (itron.aPlus  - s->aPlus)  * 3600 / (itron.uptime - s->uptime);
-      s->aMinusW = (itron.aMinus - s->aMinus) * 3600 / (itron.uptime - s->uptime);
-    }
-    s->uptime = itron.uptime;
-    s->aPlus  = itron.aPlus;
-    s->aMinus = itron.aMinus;
+static power_state_t live_power = {0, 0, 0, 0, 0};
+static const uint32_t POWER_WINDOW_S = 5;
+
+void update_power() {
+  if( itron.valid != 0x3f ) return;  // skip rejected/incomplete readings
+  if( live_power.uptime == 0 ) {
+    live_power.uptime = itron.uptime;
+    live_power.aPlus  = itron.aPlus;
+    live_power.aMinus = itron.aMinus;
+    return;
+  }
+  uint32_t dt = itron.uptime - live_power.uptime;
+  if( dt >= POWER_WINDOW_S ) {
+    live_power.aPlusW  = (itron.aPlus  - live_power.aPlus)  * 3600 / dt;
+    live_power.aMinusW = (itron.aMinus - live_power.aMinus) * 3600 / dt;
+    live_power.uptime  = itron.uptime;
+    live_power.aPlus   = itron.aPlus;
+    live_power.aMinus  = itron.aMinus;
   }
 }
 
-void send_power_card( power_state_t *s ) {
+void send_power_card() {
   snprintf(web_buf, sizeof(web_buf),
     "<div class=\"card\"><h2>Live Power</h2><div class=\"grid\">"
     "<div class=\"stat\"><div class=\"label\">Consumption (A+)</div>"
-    "<div class=\"value\">%.1f<span class=\"unit\">W</span></div>"
-    "<div class=\"sub\">%.3f kWh meter</div></div>"
+    "<div class=\"value\"><span id=\"ap_w\">%.1f</span><span class=\"unit\">W</span></div>"
+    "<div class=\"sub\"><span id=\"ap_kwh\">%.3f</span> kWh meter</div></div>"
     "<div class=\"stat\"><div class=\"label\">Backfeed (A-)</div>"
-    "<div class=\"value\">%.1f<span class=\"unit\">W</span></div>"
-    "<div class=\"sub\">%.3f kWh meter</div></div>"
+    "<div class=\"value\"><span id=\"am_w\">%.1f</span><span class=\"unit\">W</span></div>"
+    "<div class=\"sub\"><span id=\"am_kwh\">%.3f</span> kWh meter</div></div>"
     "</div></div>",
-    s->aPlusW  / 10.0, itron.aPlus  / 10000.0,
-    s->aMinusW / 10.0, itron.aMinus / 10000.0);
+    live_power.aPlusW  / 10.0, itron.aPlus  / 10000.0,
+    live_power.aMinusW / 10.0, itron.aMinus / 10000.0);
   web_server.sendContent(web_buf);
 }
 
-void send_main_page() {
-  static power_state_t home_power = {0, 0, 0, 0, 0};
-  update_power(&home_power);
+// JS poll: refresh live power, meter totals and (where present) period cells
+// without reloading the page. Lives in PROGMEM, ~600 B.
+static const char poll_script[] PROGMEM =
+  "<script>"
+  "async function r(){try{"
+  "const x=await fetch('/api/stats',{cache:'no-store'});"
+  "if(!x.ok)return;"
+  "const d=await x.json();"
+  "const s=(id,v,n)=>{const e=document.getElementById(id);"
+  "if(e)e.textContent=(v==null)?'\\u2014':v.toFixed(n);};"
+  "s('ap_w',d.ap_w,1);s('am_w',d.am_w,1);"
+  "s('ap_kwh',d.ap_kwh,3);s('am_kwh',d.am_kwh,3);"
+  "['today','yesterday','thisweek','lastweek','thismonth','lastmonth','thisyear','lastyear']"
+  ".forEach(p=>{s(p+'_in',d[p+'_in'],3);s(p+'_out',d[p+'_out'],3);});"
+  "}catch(e){}}r();setInterval(r,2000);"
+  "</script>";
 
-  send_html_head(200, "<meta http-equiv=\"refresh\" content=\"5\">");
+void send_main_page() {
+  send_html_head(200, NULL);
   send_nav("home");
-  send_power_card(&home_power);
+  send_power_card();
 
   // Status card
   char curr_time[40];
@@ -811,11 +830,54 @@ void send_main_page() {
   web_server.sendContent(web_buf);
 #endif
 
+  web_server.sendContent_P(poll_script);
   send_html_foot();
+}
+
+// Helper: emit one period's "_in/_out" key-value pair as kWh number or null
+static size_t emit_period_json( char *buf, size_t bufsize, const char *key,
+                                const period_t *cur, const period_t *base ) {
+  size_t pos = 0;
+  if( cur->valid && base->valid && cur->aPlus >= base->aPlus ) {
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_in\":%.3f",
+                    key, (cur->aPlus - base->aPlus) / 10000.0);
+  } else {
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_in\":null", key);
+  }
+  if( cur->valid && base->valid && cur->aMinus >= base->aMinus ) {
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_out\":%.3f",
+                    key, (cur->aMinus - base->aMinus) / 10000.0);
+  } else {
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_out\":null", key);
+  }
+  return pos;
 }
 
 // Define web pages for update, reset or for event infos
 void setup_webserver() {
+  // AJAX-friendly stats endpoint (separate from the stable /json API).
+  // Returns instant power, meter totals (kWh) and per-period consumption (kWh, or null).
+  web_server.on("/api/stats", []() {
+    static char json[1024];
+    size_t pos = 0;
+    pos += snprintf(json + pos, sizeof(json) - pos,
+      "{\"ap_w\":%.1f,\"am_w\":%.1f,\"ap_kwh\":%.3f,\"am_kwh\":%.3f",
+      live_power.aPlusW  / 10.0, live_power.aMinusW / 10.0,
+      itron.aPlus  / 10000.0, itron.aMinus / 10000.0);
+
+    period_t now_period = { itron.aPlus, itron.aMinus, itron.valid == 0x3f };
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "today",     &now_period,      &today_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "yesterday", &today_start,     &yesterday_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "thisweek",  &now_period,      &thisweek_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastweek",  &thisweek_start,  &lastweek_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "thismonth", &now_period,      &thismonth_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastmonth", &thismonth_start, &lastmonth_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "thisyear",  &now_period,      &thisyear_start);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastyear",  &thisyear_start,  &lastyear_start);
+    snprintf(json + pos, sizeof(json) - pos, "}");
+    web_server.send(200, "application/json", json);
+  });
+
   // Stable JSON API: keep field names and ordering (consumed by external scripts)
   web_server.on("/json", []() {
     static const char fmt[] = "{\n"
@@ -866,33 +928,31 @@ void setup_webserver() {
     ESP.restart();
   });
 
-  // Live monitor with current power and per-period consumption
+  // Live monitor with current power and per-period consumption (kWh)
   web_server.on("/monitor", []() {
-    static power_state_t mon_power = {0, 0, 0, 0, 0};
-    update_power(&mon_power);
-
-    send_html_head(200, "<meta http-equiv=\"refresh\" content=\"2; url=/monitor\">");
+    send_html_head(200, NULL);
     send_nav("monitor");
-    send_power_card(&mon_power);
+    send_power_card();
 
     period_t now_period = { itron.aPlus, itron.aMinus, itron.valid == 0x3f };
     web_server.sendContent_P(PSTR(
-      "<div class=\"card\"><h2>Consumption</h2>"
+      "<div class=\"card\"><h2>Consumption (kWh)</h2>"
       "<table><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr>"));
-    emit_period_row("Today",      &now_period,      &today_start);
-    emit_period_row("Yesterday",  &today_start,     &yesterday_start);
-    emit_period_row("This week",  &now_period,      &thisweek_start);
-    emit_period_row("Last week",  &thisweek_start,  &lastweek_start);
-    emit_period_row("This month", &now_period,      &thismonth_start);
-    emit_period_row("Last month", &thismonth_start, &lastmonth_start);
-    emit_period_row("This year",  &now_period,      &thisyear_start);
-    emit_period_row("Last year",  &thisyear_start,  &lastyear_start);
+    emit_period_row("Today",      "today",     &now_period,      &today_start);
+    emit_period_row("Yesterday",  "yesterday", &today_start,     &yesterday_start);
+    emit_period_row("This week",  "thisweek",  &now_period,      &thisweek_start);
+    emit_period_row("Last week",  "lastweek",  &thisweek_start,  &lastweek_start);
+    emit_period_row("This month", "thismonth", &now_period,      &thismonth_start);
+    emit_period_row("Last month", "lastmonth", &thismonth_start, &lastmonth_start);
+    emit_period_row("This year",  "thisyear",  &now_period,      &thisyear_start);
+    emit_period_row("Last year",  "lastyear",  &thisyear_start,  &lastyear_start);
     web_server.sendContent_P(PSTR(
       "</table>"
       "<p class=\"muted\" style=\"font-size:.8rem\">"
       "A dash (&mdash;) means no baseline value is available yet for that period."
       "</p></div>"));
 
+    web_server.sendContent_P(poll_script);
     send_html_foot();
   });
 
@@ -1334,6 +1394,7 @@ void sml_data( char *data, size_t len ) {
       last_aPlus = itron.aPlus;
       last_aMinus = itron.aMinus;
       update_period_baselines();
+      update_power();
     }
   }
 
