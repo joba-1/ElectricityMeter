@@ -721,6 +721,12 @@ void update_power() {
     live_power.aMinus = itron.aMinus;
     return;
   }
+  if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
+    live_power.uptime = itron.uptime;
+    live_power.aPlus  = itron.aPlus;
+    live_power.aMinus = itron.aMinus;
+    return;
+  }
   uint32_t dt = itron.uptime - live_power.uptime;
   if( dt >= POWER_WINDOW_S ) {
     live_power.aPlusW  = (itron.aPlus  - live_power.aPlus)  * 3600 / dt;
@@ -756,7 +762,10 @@ void send_power_card() {
 static const char poll_script[] PROGMEM =
   "<script>"
   "async function r(){try{"
-  "const x=await fetch('/api/stats',{cache:'no-store'});"
+  "const ac=new AbortController();"
+  "const t=setTimeout(()=>ac.abort(),5000);"
+  "const x=await fetch('/api/stats',{cache:'no-store',signal:ac.signal});"
+  "clearTimeout(t);"
   "if(!x.ok)return;"
   "const d=await x.json();"
   "const s=(id,v,n)=>{const e=document.getElementById(id);"
@@ -765,7 +774,8 @@ static const char poll_script[] PROGMEM =
   "s('ap_kwh',d.ap_kwh,4);s('am_kwh',d.am_kwh,4);"
   "['today','yesterday','thisweek','lastweek','thismonth','lastmonth','thisyear','lastyear']"
   ".forEach(p=>{s(p+'_in',d[p+'_in'],4);s(p+'_out',d[p+'_out'],4);});"
-  "}catch(e){}}r();setInterval(r,2000);"
+  "}catch(e){}finally{setTimeout(r,2000);}}"
+  "r();"
   "</script>";
 
 void send_main_page() {
@@ -953,7 +963,7 @@ void setup_webserver() {
       && thismonth_start.valid && lastmonth_start.valid
       && thisyear_start.valid && lastyear_start.valid;
     web_server.sendContent_P(PSTR(
-      "<div class=\"card\"><h2 class=\"cap\">Consumption</h2>"
+      "<div class=\"card\"><h2><span class=\"cap\">Consumption</span> (kWh)</h2>"
       "<table><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
     emit_period_row("Today",      "today",     &now_period,      &today_start);
     emit_period_row("Yesterday",  "yesterday", &today_start,     &yesterday_start);
@@ -1384,28 +1394,36 @@ void sml_data( char *data, size_t len ) {
     
     // Validate readings are within configured power limits
     if( last_uptime > 0 ) {
-      uint32_t delta_time_s = itron.uptime - last_uptime;
-      if( delta_time_s > 0 ) {
-        bool valid = true;
-        // Check A+ (production)
-        if( itron.aPlus >= last_aPlus ) {
+      // If energy counters went backwards the meter was power-cycled and reset.
+      // Reject this reading and reset both baselines so the next reading starts
+      // fresh — otherwise every subsequent reading would also be rejected, and
+      // the corrupted live_power anchor would cause uint64 underflow forever.
+      if( itron.aPlus < last_aPlus || itron.aMinus < last_aMinus ) {
+        syslog.logf(LOG_WARNING, "Meter counter reset (A+: %llu->%llu, A-: %llu->%llu), resetting baselines",
+                    last_aPlus, itron.aPlus, last_aMinus, itron.aMinus);
+        last_uptime = itron.uptime;
+        last_aPlus  = itron.aPlus;
+        last_aMinus = itron.aMinus;
+        memset(&live_power, 0, sizeof(live_power));
+        itron.valid = 0;
+      }
+      else {
+        uint32_t delta_time_s = itron.uptime - last_uptime;
+        if( delta_time_s > 0 ) {
+          bool valid = true;
           if( !is_power_valid(itron.aPlus, last_aPlus, delta_time_s, true) ) {
-            syslog.logf(LOG_WARNING, "Rejected reading: A+ delta=%llu in %u s exceeds PROD_KW_MAX=%u", 
-                        itron.aPlus - last_aPlus, delta_time_s, PROD_KW_MAX);
+            syslog.logf(LOG_WARNING, "Rejected reading: A+ delta=%llu in %u s exceeds USAGE_KW_MAX=%u",
+                        itron.aPlus - last_aPlus, delta_time_s, USAGE_KW_MAX);
             valid = false;
           }
-        }
-        // Check A- (consumption)
-        if( itron.aMinus >= last_aMinus ) {
           if( !is_power_valid(itron.aMinus, last_aMinus, delta_time_s, false) ) {
-            syslog.logf(LOG_WARNING, "Rejected reading: A- delta=%llu in %u s exceeds USAGE_KW_MAX=%u", 
-                        itron.aMinus - last_aMinus, delta_time_s, USAGE_KW_MAX);
+            syslog.logf(LOG_WARNING, "Rejected reading: A- delta=%llu in %u s exceeds PROD_KW_MAX=%u",
+                        itron.aMinus - last_aMinus, delta_time_s, PROD_KW_MAX);
             valid = false;
           }
-        }
-        // If any value is out of range, invalidate entire reading
-        if( !valid ) {
-          itron.valid = 0;
+          if( !valid ) {
+            itron.valid = 0;
+          }
         }
       }
     }
