@@ -581,7 +581,7 @@ void update_period_baselines() {
 }
 
 void format_kwh( char *buf, size_t bufsize, uint64_t one_tenth_wh ) {
-  snprintf(buf, bufsize, "%.3f", one_tenth_wh / 10000.0);
+  snprintf(buf, bufsize, "%.4f", one_tenth_wh / 10000.0);
 }
 
 // Shared chunk of buffer for HTML composition (one HTTP request at a time)
@@ -606,14 +606,14 @@ static const char css_block[] PROGMEM =
   "main{max-width:920px;margin:0 auto;padding:1rem}"
   ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;"
         "padding:1rem;margin-bottom:1rem}"
-  ".card h2{margin:0 0 .75rem;font-size:.8rem;color:#8b949e;text-transform:uppercase;"
-           "letter-spacing:.06em;font-weight:600}"
+  ".card h2{margin:0 0 .75rem;font-size:.8rem;color:#8b949e;font-weight:600}"
+  ".cap{text-transform:uppercase;letter-spacing:.05em}"
   "table{width:100%;border-collapse:collapse}"
   "th,td{padding:.55rem .5rem;text-align:right;border-bottom:1px solid #21262d;"
         "font-variant-numeric:tabular-nums}"
   "th:first-child,td:first-child{text-align:left}"
-  "th{color:#8b949e;font-weight:600;font-size:.78rem;text-transform:uppercase;"
-     "letter-spacing:.04em}"
+  "th{color:#8b949e;font-weight:600;font-size:.78rem}"
+  "thead th{text-transform:uppercase;letter-spacing:.04em}"
   "tr:last-child td{border-bottom:none}"
   ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem}"
   ".stat{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.75rem}"
@@ -704,7 +704,7 @@ struct power_state_t {
 };
 
 static power_state_t live_power = {0, 0, 0, 0, 0};
-static const uint32_t POWER_WINDOW_S = 5;
+static const uint32_t POWER_WINDOW_S = 30;
 
 // Last meter readings from a validated SML message. Used for display so a
 // partial or rejected message that lands in the global itron doesn't make
@@ -725,21 +725,26 @@ void update_power() {
   if( dt >= POWER_WINDOW_S ) {
     live_power.aPlusW  = (itron.aPlus  - live_power.aPlus)  * 3600 / dt;
     live_power.aMinusW = (itron.aMinus - live_power.aMinus) * 3600 / dt;
-    live_power.uptime  = itron.uptime;
-    live_power.aPlus   = itron.aPlus;
-    live_power.aMinus  = itron.aMinus;
+    // Only reset anchor when window exceeds 2x minimum — this keeps the window
+    // growing (and updating the display on every reading) rather than resetting
+    // to zero on each chunk boundary, which causes 0/72W toggling at low power.
+    if( dt >= 2 * POWER_WINDOW_S ) {
+      live_power.uptime = itron.uptime;
+      live_power.aPlus  = itron.aPlus;
+      live_power.aMinus = itron.aMinus;
+    }
   }
 }
 
 void send_power_card() {
   snprintf(web_buf, sizeof(web_buf),
-    "<div class=\"card\"><h2>Live Power</h2><div class=\"grid\">"
+    "<div class=\"card\"><h2 class=\"cap\">Live Power</h2><div class=\"grid\">"
     "<div class=\"stat\"><div class=\"label\">Consumption (A+)</div>"
     "<div class=\"value\"><span id=\"ap_w\">%.1f</span><span class=\"unit\">W</span></div>"
-    "<div class=\"sub\"><span id=\"ap_kwh\">%.3f</span> kWh</div></div>"
+    "<div class=\"sub\"><span id=\"ap_kwh\">%.4f</span> kWh</div></div>"
     "<div class=\"stat\"><div class=\"label\">Backfeed (A-)</div>"
     "<div class=\"value\"><span id=\"am_w\">%.1f</span><span class=\"unit\">W</span></div>"
-    "<div class=\"sub\"><span id=\"am_kwh\">%.3f</span> kWh</div></div>"
+    "<div class=\"sub\"><span id=\"am_kwh\">%.4f</span> kWh</div></div>"
     "</div></div>",
     live_power.aPlusW  / 10.0, latest_aPlus  / 10000.0,
     live_power.aMinusW / 10.0, latest_aMinus / 10000.0);
@@ -757,9 +762,9 @@ static const char poll_script[] PROGMEM =
   "const s=(id,v,n)=>{const e=document.getElementById(id);"
   "if(e)e.textContent=(v==null)?'\\u2014':v.toFixed(n);};"
   "s('ap_w',d.ap_w,1);s('am_w',d.am_w,1);"
-  "s('ap_kwh',d.ap_kwh,3);s('am_kwh',d.am_kwh,3);"
+  "s('ap_kwh',d.ap_kwh,4);s('am_kwh',d.am_kwh,4);"
   "['today','yesterday','thisweek','lastweek','thismonth','lastmonth','thisyear','lastyear']"
-  ".forEach(p=>{s(p+'_in',d[p+'_in'],3);s(p+'_out',d[p+'_out'],3);});"
+  ".forEach(p=>{s(p+'_in',d[p+'_in'],4);s(p+'_out',d[p+'_out'],4);});"
   "}catch(e){}}r();setInterval(r,2000);"
   "</script>";
 
@@ -846,13 +851,13 @@ static size_t emit_period_json( char *buf, size_t bufsize, const char *key,
                                 const period_t *cur, const period_t *base ) {
   size_t pos = 0;
   if( cur->valid && base->valid && cur->aPlus >= base->aPlus ) {
-    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_in\":%.3f",
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_in\":%.4f",
                     key, (cur->aPlus - base->aPlus) / 10000.0);
   } else {
     pos += snprintf(buf + pos, bufsize - pos, ",\"%s_in\":null", key);
   }
   if( cur->valid && base->valid && cur->aMinus >= base->aMinus ) {
-    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_out\":%.3f",
+    pos += snprintf(buf + pos, bufsize - pos, ",\"%s_out\":%.4f",
                     key, (cur->aMinus - base->aMinus) / 10000.0);
   } else {
     pos += snprintf(buf + pos, bufsize - pos, ",\"%s_out\":null", key);
@@ -868,7 +873,7 @@ void setup_webserver() {
     static char json[1024];
     size_t pos = 0;
     pos += snprintf(json + pos, sizeof(json) - pos,
-      "{\"ap_w\":%.1f,\"am_w\":%.1f,\"ap_kwh\":%.3f,\"am_kwh\":%.3f",
+      "{\"ap_w\":%.1f,\"am_w\":%.1f,\"ap_kwh\":%.4f,\"am_kwh\":%.4f",
       live_power.aPlusW  / 10.0, live_power.aMinusW / 10.0,
       latest_aPlus / 10000.0, latest_aMinus / 10000.0);
 
@@ -948,8 +953,8 @@ void setup_webserver() {
       && thismonth_start.valid && lastmonth_start.valid
       && thisyear_start.valid && lastyear_start.valid;
     web_server.sendContent_P(PSTR(
-      "<div class=\"card\"><h2>Consumption (kWh)</h2>"
-      "<table><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr>"));
+      "<div class=\"card\"><h2 class=\"cap\">Consumption (kWh)</h2>"
+      "<table><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
     emit_period_row("Today",      "today",     &now_period,      &today_start);
     emit_period_row("Yesterday",  "yesterday", &today_start,     &yesterday_start);
     emit_period_row("This week",  "thisweek",  &now_period,      &thisweek_start);
@@ -959,11 +964,11 @@ void setup_webserver() {
     emit_period_row("This year",  "thisyear",  &now_period,      &thisyear_start);
     emit_period_row("Last year",  "lastyear",  &thisyear_start,  &lastyear_start);
     if( all_known ) {
-      web_server.sendContent_P(PSTR("</table></div>"));
+      web_server.sendContent_P(PSTR("</tbody></table></div>"));
     }
     else {
       web_server.sendContent_P(PSTR(
-        "</table>"
+        "</tbody></table>"
         "<p class=\"muted\" style=\"font-size:.8rem\">"
         "A dash (&mdash;) means no baseline value is available yet for that period."
         "</p></div>"));
