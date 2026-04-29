@@ -706,6 +706,13 @@ struct power_state_t {
 static power_state_t live_power = {0, 0, 0, 0, 0};
 static const uint32_t POWER_WINDOW_S = 5;
 
+// Last meter readings from a validated SML message. Used for display so a
+// partial or rejected message that lands in the global itron doesn't make
+// the live values flicker to 0.
+static uint64_t latest_aPlus  = 0;
+static uint64_t latest_aMinus = 0;
+static bool     meter_seen    = false;
+
 void update_power() {
   if( itron.valid != 0x3f ) return;  // skip rejected/incomplete readings
   if( live_power.uptime == 0 ) {
@@ -729,13 +736,13 @@ void send_power_card() {
     "<div class=\"card\"><h2>Live Power</h2><div class=\"grid\">"
     "<div class=\"stat\"><div class=\"label\">Consumption (A+)</div>"
     "<div class=\"value\"><span id=\"ap_w\">%.1f</span><span class=\"unit\">W</span></div>"
-    "<div class=\"sub\"><span id=\"ap_kwh\">%.3f</span> kWh meter</div></div>"
+    "<div class=\"sub\"><span id=\"ap_kwh\">%.3f</span> kWh</div></div>"
     "<div class=\"stat\"><div class=\"label\">Backfeed (A-)</div>"
     "<div class=\"value\"><span id=\"am_w\">%.1f</span><span class=\"unit\">W</span></div>"
-    "<div class=\"sub\"><span id=\"am_kwh\">%.3f</span> kWh meter</div></div>"
+    "<div class=\"sub\"><span id=\"am_kwh\">%.3f</span> kWh</div></div>"
     "</div></div>",
-    live_power.aPlusW  / 10.0, itron.aPlus  / 10000.0,
-    live_power.aMinusW / 10.0, itron.aMinus / 10000.0);
+    live_power.aPlusW  / 10.0, latest_aPlus  / 10000.0,
+    live_power.aMinusW / 10.0, latest_aMinus / 10000.0);
   web_server.sendContent(web_buf);
 }
 
@@ -863,9 +870,9 @@ void setup_webserver() {
     pos += snprintf(json + pos, sizeof(json) - pos,
       "{\"ap_w\":%.1f,\"am_w\":%.1f,\"ap_kwh\":%.3f,\"am_kwh\":%.3f",
       live_power.aPlusW  / 10.0, live_power.aMinusW / 10.0,
-      itron.aPlus  / 10000.0, itron.aMinus / 10000.0);
+      latest_aPlus / 10000.0, latest_aMinus / 10000.0);
 
-    period_t now_period = { itron.aPlus, itron.aMinus, itron.valid == 0x3f };
+    period_t now_period = { latest_aPlus, latest_aMinus, meter_seen };
     pos += emit_period_json(json + pos, sizeof(json) - pos, "today",     &now_period,      &today_start);
     pos += emit_period_json(json + pos, sizeof(json) - pos, "yesterday", &today_start,     &yesterday_start);
     pos += emit_period_json(json + pos, sizeof(json) - pos, "thisweek",  &now_period,      &thisweek_start);
@@ -934,7 +941,12 @@ void setup_webserver() {
     send_nav("monitor");
     send_power_card();
 
-    period_t now_period = { itron.aPlus, itron.aMinus, itron.valid == 0x3f };
+    period_t now_period = { latest_aPlus, latest_aMinus, meter_seen };
+    bool all_known = meter_seen
+      && today_start.valid && yesterday_start.valid
+      && thisweek_start.valid && lastweek_start.valid
+      && thismonth_start.valid && lastmonth_start.valid
+      && thisyear_start.valid && lastyear_start.valid;
     web_server.sendContent_P(PSTR(
       "<div class=\"card\"><h2>Consumption (kWh)</h2>"
       "<table><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr>"));
@@ -946,11 +958,16 @@ void setup_webserver() {
     emit_period_row("Last month", "lastmonth", &thismonth_start, &lastmonth_start);
     emit_period_row("This year",  "thisyear",  &now_period,      &thisyear_start);
     emit_period_row("Last year",  "lastyear",  &thisyear_start,  &lastyear_start);
-    web_server.sendContent_P(PSTR(
-      "</table>"
-      "<p class=\"muted\" style=\"font-size:.8rem\">"
-      "A dash (&mdash;) means no baseline value is available yet for that period."
-      "</p></div>"));
+    if( all_known ) {
+      web_server.sendContent_P(PSTR("</table></div>"));
+    }
+    else {
+      web_server.sendContent_P(PSTR(
+        "</table>"
+        "<p class=\"muted\" style=\"font-size:.8rem\">"
+        "A dash (&mdash;) means no baseline value is available yet for that period."
+        "</p></div>"));
+    }
 
     web_server.sendContent_P(poll_script);
     send_html_foot();
@@ -1393,6 +1410,9 @@ void sml_data( char *data, size_t len ) {
       last_uptime = itron.uptime;
       last_aPlus = itron.aPlus;
       last_aMinus = itron.aMinus;
+      latest_aPlus = itron.aPlus;
+      latest_aMinus = itron.aMinus;
+      meter_seen = true;
       update_period_baselines();
       update_power();
     }
