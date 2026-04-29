@@ -722,10 +722,7 @@ void update_power() {
     return;
   }
   if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
-    live_power.uptime = itron.uptime;
-    live_power.aPlus  = itron.aPlus;
-    live_power.aMinus = itron.aMinus;
-    return;
+    return;  // safety net: sml_data should have caught this; skip to avoid underflow
   }
   uint32_t dt = itron.uptime - live_power.uptime;
   if( dt >= POWER_WINDOW_S ) {
@@ -1382,6 +1379,7 @@ void sml_data( char *data, size_t len ) {
   static uint32_t last_uptime = 0;
   static uint64_t last_aPlus = 0;
   static uint64_t last_aMinus = 0;
+  static uint8_t  backwards_count = 0;
 
   sml_len = min(len, (size_t)sizeof(sml_raw));
   memcpy(sml_raw, data, sml_len);
@@ -1394,30 +1392,35 @@ void sml_data( char *data, size_t len ) {
     
     // Validate readings are within configured power limits
     if( last_uptime > 0 ) {
-      // If energy counters went backwards the meter was power-cycled and reset.
-      // Reject this reading and reset both baselines so the next reading starts
-      // fresh — otherwise every subsequent reading would also be rejected, and
-      // the corrupted live_power anchor would cause uint64 underflow forever.
       if( itron.aPlus < last_aPlus || itron.aMinus < last_aMinus ) {
-        syslog.logf(LOG_WARNING, "Meter counter reset (A+: %llu->%llu, A-: %llu->%llu), resetting baselines",
-                    last_aPlus, itron.aPlus, last_aMinus, itron.aMinus);
-        last_uptime = itron.uptime;
-        last_aPlus  = itron.aPlus;
-        last_aMinus = itron.aMinus;
-        memset(&live_power, 0, sizeof(live_power));
-        itron.valid = 0;
+        // Backwards counter: could be a bit-error (common, single occurrence) or
+        // a genuine meter reset after power loss (sustained run of backwards values).
+        // Only declare a reset after 5 consecutive backwards readings so isolated
+        // read errors are silently dropped without disturbing the baselines.
+        if( ++backwards_count >= 5 ) {
+          syslog.logf(LOG_WARNING,
+            "Meter reset confirmed after %u backwards readings, new baseline A+=%llu A-=%llu",
+            backwards_count, itron.aPlus, itron.aMinus);
+          last_uptime = itron.uptime;
+          last_aPlus  = itron.aPlus;
+          last_aMinus = itron.aMinus;
+          memset(&live_power, 0, sizeof(live_power));
+          backwards_count = 0;
+        }
+        itron.valid = 0;  // always discard the backwards reading itself
       }
       else {
+        backwards_count = 0;
         uint32_t delta_time_s = itron.uptime - last_uptime;
         if( delta_time_s > 0 ) {
           bool valid = true;
           if( !is_power_valid(itron.aPlus, last_aPlus, delta_time_s, true) ) {
-            syslog.logf(LOG_WARNING, "Rejected reading: A+ delta=%llu in %u s exceeds USAGE_KW_MAX=%u",
+            syslog.logf(LOG_WARNING, "Rejected: A+ delta=%llu in %u s exceeds USAGE_KW_MAX=%u",
                         itron.aPlus - last_aPlus, delta_time_s, USAGE_KW_MAX);
             valid = false;
           }
           if( !is_power_valid(itron.aMinus, last_aMinus, delta_time_s, false) ) {
-            syslog.logf(LOG_WARNING, "Rejected reading: A- delta=%llu in %u s exceeds PROD_KW_MAX=%u",
+            syslog.logf(LOG_WARNING, "Rejected: A- delta=%llu in %u s exceeds PROD_KW_MAX=%u",
                         itron.aMinus - last_aMinus, delta_time_s, PROD_KW_MAX);
             valid = false;
           }
