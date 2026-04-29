@@ -4,6 +4,22 @@
 * Validate meter readings against configured power limits to reject bogus data
 * Optionally send power status (feeding to grid or high load) to WLED with UDP
 * Optionally set limit of an OpenDTU inverter via MQTT to avoid high feed to grid
+* Modern web UI with live power and per-period consumption (today, yesterday, this/last week, month, year)
+
+## Web UI
+
+The device serves a small set of pages; every page links to the others with a consistent
+dark-themed nav bar:
+
+* `/` – Home: live power, meter status, optional inverter and WLED cards
+* `/monitor` – auto-refreshing live power plus consumption for today, yesterday, this/last
+  week, month and year. On the first valid reading after boot the device queries InfluxDB
+  for the meter value at-or-after the start of each period so consumption stays correct
+  across reboots; periods with no historical data fall back to the current reading.
+* `/json` – stable JSON API (unchanged across versions)
+* `/sml` – last raw SML record (binary download, unchanged)
+* `/update` – OTA firmware upload
+* `POST /reset` – reboot the device
 
 ## Features
 

@@ -400,51 +400,396 @@ void handle_mqtt() {
 }
 #endif
 
-const char *main_page() {
-  // Standard page
-  static const char fmt[] =
-      "<!doctype html>\n"
-      "<html lang=\"en\">\n"
-      " <head>\n"
-      "  <title>" PROGNAME " v" VERSION "</title>\n"
-      "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-      "  <meta charset=\"utf-8\">\n"
-      "  <meta http-equiv=\"expires\" content=\"5\">\n"
-      " </head>\n"
-      " <body>\n"
-      "  <h1>" PROGNAME " v" VERSION "</h1>\n"
-      "  <table><tr>\n"
-      "   <td><form action=\"monitor\">\n"
-      "    <input type=\"submit\" name=\"monitor\" value=\"Monitor\" />\n"
-      "   </form></td>\n"
-      "   <td><form action=\"json\">\n"
-      "    <input type=\"submit\" name=\"json\" value=\"JSON\" />\n"
-      "   </form></td>\n"
-      "   <td><form action=\"sml\">\n"
-      "    <input type=\"submit\" name=\"sml\" value=\"SML\" />\n"
-      "   </form></td>\n"
-      "   <td><form action=\"reset\" method=\"post\">\n"
-      "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
-      "   </form></td>\n"
-      "  </tr></table>\n"
-      "  <div>Post firmware image to /update<div>\n"
-      "  <div>Influx status: %d<div>\n"
-      "  <div>Detailed info: %s<div>\n"
-      #ifdef DTU_TOPIC
-        "  <div>Inverter '%s' limit: %s %u W<div>\n"
-      #endif
-      #ifdef WLED_LEDS
-        "  <div>WLED status: %06x since %u seconds<div>\n"
-      #endif
-      "  <div>Last update: %s<div>\n"
-      " </body>\n"
-      "</html>\n";
-  static char page[sizeof(fmt) + 150] = "";
-  static char curr_time[30];
+// Period consumption tracking. Baselines hold the meter reading at the start
+// of each calendar period; rotating them on rollover lets us derive
+// current-period and previous-period consumption from delta math.
+typedef struct {
+  uint64_t aPlus;   // 1/10 Wh
+  uint64_t aMinus;  // 1/10 Wh
+  bool valid;
+} period_t;
+
+static period_t today_start      = {0, 0, false};
+static period_t yesterday_start  = {0, 0, false};
+static period_t thisweek_start   = {0, 0, false};
+static period_t lastweek_start   = {0, 0, false};
+static period_t thismonth_start  = {0, 0, false};
+static period_t lastmonth_start  = {0, 0, false};
+static period_t thisyear_start   = {0, 0, false};
+static period_t lastyear_start   = {0, 0, false};
+
+static int last_day_idx   = -1;
+static int last_week_idx  = -1;
+static int last_month_idx = -1;
+static int last_year_idx  = -1;
+
+// UTC epoch for the start of the local "today minus N days"
+static time_t local_day_start( time_t now, int days_back ) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_sec = 0;
+  t.tm_min = 0;
+  t.tm_hour = 0;
+  t.tm_mday -= days_back;
+  t.tm_isdst = -1;
+  return mktime(&t);
+}
+
+// UTC epoch for the start of the local Monday of "this week minus N weeks"
+static time_t local_week_start( time_t now, int weeks_back ) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_sec = 0;
+  t.tm_min = 0;
+  t.tm_hour = 0;
+  int wday_mon = (t.tm_wday + 6) % 7;  // Mon=0..Sun=6
+  t.tm_mday -= wday_mon + weeks_back * 7;
+  t.tm_isdst = -1;
+  return mktime(&t);
+}
+
+static time_t local_month_start( time_t now, int months_back ) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_sec = 0;
+  t.tm_min = 0;
+  t.tm_hour = 0;
+  t.tm_mday = 1;
+  t.tm_mon -= months_back;
+  t.tm_isdst = -1;
+  return mktime(&t);
+}
+
+static time_t local_year_start( time_t now, int years_back ) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_sec = 0;
+  t.tm_min = 0;
+  t.tm_hour = 0;
+  t.tm_mday = 1;
+  t.tm_mon = 0;
+  t.tm_year -= years_back;
+  t.tm_isdst = -1;
+  return mktime(&t);
+}
+
+// Query InfluxDB for the first 'watt' / 'watt_out' values at-or-after epoch.
+// On success, fills out and returns true. The stored values are integer Wh
+// (from post_data) so we scale back to 1/10 Wh to match itron.aPlus units.
+static bool query_baseline( time_t epoch, period_t *out ) {
+  static char url[256];
+  // Manual URL encoding: ',' -> %2C, '>=' -> %3E%3D, spaces -> '+'
+  snprintf(url, sizeof(url),
+    "/query?db=" INFLUX_DB "&epoch=s"
+    "&q=SELECT+first(watt)%%2Cfirst(watt_out)+FROM+energy+WHERE+time+%%3E%%3D+%lus",
+    (unsigned long)epoch);
+
+  http.begin(client, INFLUX_SERVER, INFLUX_PORT, url);
+  http.setUserAgent(PROGNAME);
+  http.addHeader("Accept", "application/csv");
+  int code = http.GET();
+
+  bool ok = false;
+  if( code == 200 ) {
+    String body = http.getString();
+    int nl = body.indexOf('\n');
+    if( nl > 0 && (size_t)(nl + 1) < body.length() ) {
+      // CSV columns: name,tags,time,first,first_1 — skip 3 commas to reach 'first'
+      const char *line = body.c_str() + nl + 1;
+      int comma = 0;
+      while( *line && comma < 3 ) {
+        if( *line == ',' ) comma++;
+        line++;
+      }
+      if( comma == 3 ) {
+        char *end;
+        unsigned long long ap = strtoull(line, &end, 10);
+        if( end > line && *end == ',' ) {
+          unsigned long long am = strtoull(end + 1, &end, 10);
+          out->aPlus  = (uint64_t)ap * 10;
+          out->aMinus = (uint64_t)am * 10;
+          out->valid  = true;
+          ok = true;
+        }
+      }
+    }
+  }
+  http.end();
+  if( !ok ) {
+    syslog.logf(LOG_NOTICE, "Influx baseline query for epoch %lu http=%d (no data?)",
+                (unsigned long)epoch, code);
+  }
+  return ok;
+}
+
+static void load_baselines_from_influx( time_t now ) {
+  syslog.log(LOG_NOTICE, "Loading period baselines from InfluxDB");
+  query_baseline(local_day_start(now, 0),    &today_start);
+  query_baseline(local_day_start(now, 1),    &yesterday_start);
+  query_baseline(local_week_start(now, 0),   &thisweek_start);
+  query_baseline(local_week_start(now, 1),   &lastweek_start);
+  query_baseline(local_month_start(now, 0),  &thismonth_start);
+  query_baseline(local_month_start(now, 1),  &lastmonth_start);
+  query_baseline(local_year_start(now, 0),   &thisyear_start);
+  query_baseline(local_year_start(now, 1),   &lastyear_start);
+  syslog.logf(LOG_NOTICE,
+    "Baselines loaded: today=%d yest=%d thisweek=%d lastweek=%d "
+    "thismonth=%d lastmonth=%d thisyear=%d lastyear=%d",
+    today_start.valid, yesterday_start.valid,
+    thisweek_start.valid, lastweek_start.valid,
+    thismonth_start.valid, lastmonth_start.valid,
+    thisyear_start.valid, lastyear_start.valid);
+}
+
+void update_period_baselines() {
+  if( itron.valid != 0x3f ) return;
+  time_t now = time(NULL);
+  if( now < 1000000000 ) return;  // wait for NTP sync (seconds since epoch ~2001)
+
+  struct tm tm_now;
+  localtime_r(&now, &tm_now);
+
+  int day_idx   = tm_now.tm_year * 400 + tm_now.tm_yday;  // unique per local day
+  int wday_mon  = (tm_now.tm_wday + 6) % 7;               // Mon=0..Sun=6
+  int week_idx  = day_idx - wday_mon;                     // unique per ISO-style week
+  int month_idx = tm_now.tm_year * 12 + tm_now.tm_mon;
+  int year_idx  = tm_now.tm_year;
+
+  period_t curr = { itron.aPlus, itron.aMinus, true };
+
+  if( last_day_idx == -1 ) {
+    // First valid reading after boot+NTP: try to recover historical baselines
+    // from InfluxDB so reboots don't reset our period counters.
+    load_baselines_from_influx(now);
+    // Fall back to current reading for any period without InfluxDB data.
+    if( !today_start.valid     ) today_start     = curr;
+    if( !thisweek_start.valid  ) thisweek_start  = curr;
+    if( !thismonth_start.valid ) thismonth_start = curr;
+    if( !thisyear_start.valid  ) thisyear_start  = curr;
+  }
+  else {
+    if( day_idx   != last_day_idx   ) { yesterday_start = today_start;     today_start     = curr; }
+    if( week_idx  != last_week_idx  ) { lastweek_start  = thisweek_start;  thisweek_start  = curr; }
+    if( month_idx != last_month_idx ) { lastmonth_start = thismonth_start; thismonth_start = curr; }
+    if( year_idx  != last_year_idx  ) { lastyear_start  = thisyear_start;  thisyear_start  = curr; }
+  }
+
+  last_day_idx   = day_idx;
+  last_week_idx  = week_idx;
+  last_month_idx = month_idx;
+  last_year_idx  = year_idx;
+}
+
+void format_wh( char *buf, size_t bufsize, uint64_t one_tenth_wh ) {
+  double wh = one_tenth_wh / 10.0;
+  if( wh >= 1000.0 ) {
+    snprintf(buf, bufsize, "%.3f kWh", wh / 1000.0);
+  }
+  else {
+    snprintf(buf, bufsize, "%.1f Wh", wh);
+  }
+}
+
+// Shared chunk of buffer for HTML composition (one HTTP request at a time)
+static char web_buf[1536];
+
+static const char css_block[] PROGMEM =
+  "<style>"
+  "*{box-sizing:border-box}"
+  "body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+       "background:#0d1117;color:#c9d1d9;line-height:1.5}"
+  "header{background:#161b22;padding:1rem;border-bottom:1px solid #30363d}"
+  "h1{margin:0;font-size:1.25rem;color:#58a6ff;font-weight:600}"
+  "h1 .muted{font-size:.85rem;font-weight:400;margin-left:.5rem}"
+  "nav{background:#161b22;padding:.5rem 1rem;border-bottom:1px solid #30363d;"
+      "display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}"
+  "nav a,nav button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
+                   "padding:.5rem .9rem;border-radius:6px;text-decoration:none;"
+                   "font-size:.9rem;cursor:pointer;font-family:inherit}"
+  "nav a:hover,nav button:hover{background:#30363d;border-color:#58a6ff}"
+  "nav a.active{background:#1f6feb;border-color:#1f6feb;color:#fff}"
+  "nav .right{margin-left:auto}"
+  "main{max-width:920px;margin:0 auto;padding:1rem}"
+  ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;"
+        "padding:1rem;margin-bottom:1rem}"
+  ".card h2{margin:0 0 .75rem;font-size:.8rem;color:#8b949e;text-transform:uppercase;"
+           "letter-spacing:.06em;font-weight:600}"
+  "table{width:100%;border-collapse:collapse}"
+  "th,td{padding:.55rem .5rem;text-align:right;border-bottom:1px solid #21262d;"
+        "font-variant-numeric:tabular-nums}"
+  "th:first-child,td:first-child{text-align:left}"
+  "th{color:#8b949e;font-weight:600;font-size:.78rem;text-transform:uppercase;"
+     "letter-spacing:.04em}"
+  "tr:last-child td{border-bottom:none}"
+  ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem}"
+  ".stat{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.75rem}"
+  ".stat .label{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}"
+  ".stat .value{font-size:1.5rem;font-weight:600;margin-top:.2rem;color:#58a6ff;"
+               "font-variant-numeric:tabular-nums}"
+  ".stat .unit{font-size:.85rem;color:#8b949e;font-weight:400;margin-left:.25rem}"
+  ".stat .sub{font-size:.78rem;color:#8b949e;margin-top:.2rem}"
+  ".muted{color:#8b949e}"
+  ".pos{color:#3fb950}"
+  ".neg{color:#f85149}"
+  ".swatch{display:inline-block;width:1em;height:1em;border-radius:3px;"
+          "border:1px solid #30363d;vertical-align:middle;margin-right:.4em}"
+  "code{background:#0d1117;padding:.1rem .35rem;border-radius:3px;font-size:.85em;"
+       "border:1px solid #30363d}"
+  "footer{text-align:center;padding:1rem;color:#8b949e;font-size:.8rem}"
+  "footer a{color:#8b949e}"
+  "p{margin:.5rem 0}"
+  "</style>";
+
+void send_html_head( int status, const char *meta_refresh ) {
+  web_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  web_server.send(status, "text/html", "");
+  web_server.sendContent_P(PSTR(
+    "<!doctype html><html lang=\"en\"><head>"
+    "<title>" PROGNAME " " HOSTNAME " v" VERSION "</title>"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<meta charset=\"utf-8\">"));
+  if( meta_refresh && *meta_refresh ) {
+    web_server.sendContent(meta_refresh);
+  }
+  web_server.sendContent_P(css_block);
+  web_server.sendContent_P(PSTR(
+    "</head><body>"
+    "<header><h1>" PROGNAME
+    " <span class=\"muted\">" HOSTNAME " &middot; v" VERSION "</span></h1></header>"));
+}
+
+void send_nav( const char *active ) {
+  snprintf_P(web_buf, sizeof(web_buf), PSTR(
+    "<nav>"
+    "<a href=\"/\"%s>Home</a>"
+    "<a href=\"/monitor\"%s>Monitor</a>"
+    "<a href=\"/json\" target=\"_blank\">JSON</a>"
+    "<a href=\"/sml\">SML</a>"
+    "<form method=\"post\" action=\"/reset\" class=\"right\" "
+    "onsubmit=\"return confirm('Reset device?');\">"
+    "<button type=\"submit\">Reset</button>"
+    "</form>"
+    "</nav><main>"),
+    strcmp(active, "home")    == 0 ? " class=\"active\"" : "",
+    strcmp(active, "monitor") == 0 ? " class=\"active\"" : "");
+  web_server.sendContent(web_buf);
+}
+
+void send_html_foot() {
+  web_server.sendContent_P(PSTR(
+    "</main><footer>" PROGNAME " v" VERSION " &middot; "
+    "<a href=\"/update\">OTA update</a>"
+    "</footer></body></html>"));
+  web_server.sendContent("");
+}
+
+void emit_period_row( const char *label, const period_t *cur, const period_t *base ) {
+  char in_buf[24]  = "&mdash;";
+  char out_buf[24] = "&mdash;";
+  if( cur->valid && base->valid && cur->aPlus >= base->aPlus ) {
+    format_wh(in_buf, sizeof(in_buf), cur->aPlus - base->aPlus);
+  }
+  if( cur->valid && base->valid && cur->aMinus >= base->aMinus ) {
+    format_wh(out_buf, sizeof(out_buf), cur->aMinus - base->aMinus);
+  }
+  snprintf(web_buf, sizeof(web_buf),
+    "<tr><th>%s</th><td>%s</td><td>%s</td></tr>", label, in_buf, out_buf);
+  web_server.sendContent(web_buf);
+}
+
+// Compute instantaneous power (1/10 W) by tracking deltas between successive readings.
+// The static state is per-page so home and monitor each get a smooth value.
+struct power_state_t {
+  uint32_t uptime;
+  uint64_t aPlus;
+  uint64_t aMinus;
+  uint64_t aPlusW;   // 1/10 W
+  uint64_t aMinusW;  // 1/10 W
+};
+
+void update_power( power_state_t *s ) {
+  if( s->uptime != itron.uptime && (itron.aPlus != s->aPlus || itron.aMinus != s->aMinus) ) {
+    if( s->uptime ) {
+      s->aPlusW  = (itron.aPlus  - s->aPlus)  * 3600 / (itron.uptime - s->uptime);
+      s->aMinusW = (itron.aMinus - s->aMinus) * 3600 / (itron.uptime - s->uptime);
+    }
+    s->uptime = itron.uptime;
+    s->aPlus  = itron.aPlus;
+    s->aMinus = itron.aMinus;
+  }
+}
+
+void send_power_card( power_state_t *s ) {
+  snprintf(web_buf, sizeof(web_buf),
+    "<div class=\"card\"><h2>Live Power</h2><div class=\"grid\">"
+    "<div class=\"stat\"><div class=\"label\">Consumption (A+)</div>"
+    "<div class=\"value\">%.1f<span class=\"unit\">W</span></div>"
+    "<div class=\"sub\">%.3f kWh meter</div></div>"
+    "<div class=\"stat\"><div class=\"label\">Backfeed (A-)</div>"
+    "<div class=\"value\">%.1f<span class=\"unit\">W</span></div>"
+    "<div class=\"sub\">%.3f kWh meter</div></div>"
+    "</div></div>",
+    s->aPlusW  / 10.0, itron.aPlus  / 10000.0,
+    s->aMinusW / 10.0, itron.aMinus / 10000.0);
+  web_server.sendContent(web_buf);
+}
+
+void send_main_page() {
+  static power_state_t home_power = {0, 0, 0, 0, 0};
+  update_power(&home_power);
+
+  send_html_head(200, "<meta http-equiv=\"refresh\" content=\"5\">");
+  send_nav("home");
+  send_power_card(&home_power);
+
+  // Status card
+  char curr_time[40];
   time_t now;
   time(&now);
   strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
-  #ifdef WLED_LEDS
+
+  char serial_str[40];
+  char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
+  strncpy(serial_str, serial, sizeof(serial_str) - 1);
+  serial_str[sizeof(serial_str) - 1] = '\0';
+
+  snprintf(web_buf, sizeof(web_buf),
+    "<div class=\"card\"><h2>Status</h2><table>"
+    "<tr><th>Meter</th><td>%3.3s &middot; <code>%s</code></td></tr>"
+    "<tr><th>Detailed readings</th><td>%s</td></tr>"
+    "<tr><th>InfluxDB</th><td><code>" INFLUX_SERVER "</code> status %d</td></tr>"
+    "<tr><th>Last update</th><td>%s</td></tr>"
+    "</table></div>",
+    itron.id, serial_str,
+    recv_detailed ? "<span class=\"pos\">yes (1/10 Wh)</span>"
+                  : "<span class=\"neg\">no (kWh only)</span>",
+    influx_status, curr_time);
+  web_server.sendContent(web_buf);
+
+#ifdef DTU_TOPIC
+  if( curr_limit != UINT16_MAX ) {
+    snprintf(web_buf, sizeof(web_buf),
+      "<div class=\"card\"><h2>Inverter</h2><table>"
+      "<tr><th>Name</th><td>%s</td></tr>"
+      "<tr><th>Reachable</th><td>%s</td></tr>"
+      "<tr><th>Limit mode</th><td>%s</td></tr>"
+      "<tr><th>Current limit</th><td>%u W</td></tr>"
+      "</table></div>",
+      inverter,
+      reachable ? "<span class=\"pos\">yes</span>" : "<span class=\"neg\">no</span>",
+      dynamic   ? "dynamic" : "static",
+      curr_limit);
+  }
+  else {
+    snprintf(web_buf, sizeof(web_buf),
+      "<div class=\"card\"><h2>Inverter</h2>"
+      "<div class=\"muted\">Waiting for MQTT data on "
+      "<code>" DTU_TOPIC "/" INVERTER_SERIAL "</code></div></div>");
+  }
+  web_server.sendContent(web_buf);
+#endif
+
+#ifdef WLED_LEDS
   uint32_t now_ms = millis();
   if( (wled_r || wled_g || wled_b) && (now_ms - wled_update) >= (wled_secs * 1000) ) {
     wled_change += wled_secs * 1000;
@@ -452,23 +797,26 @@ const char *main_page() {
     wled_g = 0;
     wled_b = 0;
   }
-  #endif
-  snprintf(page, sizeof(page), fmt, influx_status, recv_detailed ? "yes" : "no",
-  #ifdef DTU_TOPIC
-           inverter,
-           dynamic ? "dynamic" : "static",
-           curr_limit,
-  #endif
-  #ifdef WLED_LEDS
-           (wled_r << 16) + (wled_g << 8) + wled_b,
-           (now_ms - wled_change) / 1000,
-  #endif
-           curr_time);
-  return page;
+  uint32_t color_int = ((uint32_t)wled_r << 16) | ((uint32_t)wled_g << 8) | wled_b;
+  snprintf(web_buf, sizeof(web_buf),
+    "<div class=\"card\"><h2>WLED</h2><table>"
+    "<tr><th>Host</th><td><code>" WLED_HOST ":%d</code> &middot; %d LEDs</td></tr>"
+    "<tr><th>Color</th><td><span class=\"swatch\" style=\"background:#%06x\"></span>"
+    "<code>#%06x</code></td></tr>"
+    "<tr><th>Stable for</th><td>%u s</td></tr>"
+    "</table></div>",
+    WLED_PORT, WLED_LEDS,
+    color_int, color_int,
+    (now_ms - wled_change) / 1000);
+  web_server.sendContent(web_buf);
+#endif
+
+  send_html_foot();
 }
 
 // Define web pages for update, reset or for event infos
 void setup_webserver() {
+  // Stable JSON API: keep field names and ordering (consumed by external scripts)
   web_server.on("/json", []() {
     static const char fmt[] = "{\n"
                               " \"meta\": {\n"
@@ -499,70 +847,70 @@ void setup_webserver() {
     web_server.send(200, "application/json", msg);
   });
 
-  // download last raw SML record
+  // Download last raw SML record (binary)
   web_server.on("/sml", []() {
     web_server.send(200, "application/octet-stream", sml_raw, sml_len);
   });
 
-  // Call this page to reset the ESP
+  // Reset the ESP (POST only)
   web_server.on("/reset", HTTP_POST, []() {
     syslog.log(LOG_NOTICE, "RESET");
-    web_server.send(200, "text/html",
-                    "<html>\n"
-                    " <head>\n"
-                    "  <title>" PROGNAME " v" VERSION "</title>\n"
-                    "  <meta http-equiv=\"refresh\" content=\"7; url=/\"> \n"
-                    " </head>\n"
-                    " <body>Resetting...</body>\n"
-                    "</html>\n");
+    send_html_head(200, "<meta http-equiv=\"refresh\" content=\"7; url=/\">");
+    send_nav("");
+    web_server.sendContent_P(PSTR(
+      "<div class=\"card\"><h2>Reset</h2>"
+      "<p>Resetting device&hellip; you will be redirected back to the home page in a few seconds.</p>"
+      "</div>"));
+    send_html_foot();
     delay(200);
     ESP.restart();
   });
 
-  // Call this page to monitor power closely
+  // Live monitor with current power and per-period consumption
   web_server.on("/monitor", []() {
-    static const char fmt[] = 
-      "<!doctype html>\n"
-      "<html lang=\"en\">\n"
-      " <head>\n"
-      "  <title>" PROGNAME " v" VERSION "</title>\n"
-      "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-      "  <meta charset=\"utf-8\">\n"
-      "  <meta http-equiv=\"refresh\" content=\"2; url=/monitor\"> \n"
-      " </head>\n"
-      " <body><h1> " HOSTNAME " Monitor v" VERSION "</h1><table>\n"
-      "  <tr><th align=\"right\">Power</th><th align=\"right\">Wh</th><th align=\"right\">W</th></tr>\n"
-      "  <tr><th align=\"right\">A+</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
-      "  <tr><th align=\"right\">A-</th><td align=\"right\">%.1f</td><td align=\"right\">%.1f</td></tr>\n"
-      " </table></body>\n"
-      "</html>\n";
-    static char msg[sizeof(fmt) + 4 * 20];
-    static uint32_t uptime = 0;
-    static uint64_t aPlus = 0;
-    static uint64_t aMinus = 0;
-    static uint64_t aPlusW = 0;   // now 1/10W
-    static uint64_t aMinusW = 0;  // now 1/10W
-    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
-      if( uptime ) {
-        aPlusW = (itron.aPlus - aPlus) * 3600 / (itron.uptime - uptime);
-        aMinusW = (itron.aMinus - aMinus) * 3600 / (itron.uptime - uptime);
-      }
-      uptime = itron.uptime;
-      aPlus = itron.aPlus;
-      aMinus= itron.aMinus;
-    }
-    snprintf(msg, sizeof(msg), fmt, itron.aPlus/10.0, aPlusW/10.0, itron.aMinus/10.0, aMinusW/10.0);
-    web_server.send(200, "text/html", msg);
+    static power_state_t mon_power = {0, 0, 0, 0, 0};
+    update_power(&mon_power);
+
+    send_html_head(200, "<meta http-equiv=\"refresh\" content=\"2; url=/monitor\">");
+    send_nav("monitor");
+    send_power_card(&mon_power);
+
+    period_t now_period = { itron.aPlus, itron.aMinus, itron.valid == 0x3f };
+    web_server.sendContent_P(PSTR(
+      "<div class=\"card\"><h2>Consumption</h2>"
+      "<table><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr>"));
+    emit_period_row("Today",      &now_period,      &today_start);
+    emit_period_row("Yesterday",  &today_start,     &yesterday_start);
+    emit_period_row("This week",  &now_period,      &thisweek_start);
+    emit_period_row("Last week",  &thisweek_start,  &lastweek_start);
+    emit_period_row("This month", &now_period,      &thismonth_start);
+    emit_period_row("Last month", &thismonth_start, &lastmonth_start);
+    emit_period_row("This year",  &now_period,      &thisyear_start);
+    emit_period_row("Last year",  &thisyear_start,  &lastyear_start);
+    web_server.sendContent_P(PSTR(
+      "</table>"
+      "<p class=\"muted\" style=\"font-size:.8rem\">"
+      "Period baselines are kept in RAM and reset on reboot; values "
+      "shown for ongoing periods grow until the next rollover."
+      "</p></div>"));
+
+    send_html_foot();
   });
 
   // Index page
   web_server.on("/", []() {
-    web_server.send(200, "text/html", main_page());
+    send_main_page();
   });
 
-  // Catch all page
+  // 404
   web_server.onNotFound([]() {
-    web_server.send(404, "text/html", main_page());
+    send_html_head(404, NULL);
+    send_nav("");
+    web_server.sendContent_P(PSTR(
+      "<div class=\"card\"><h2>404 Not Found</h2>"
+      "<p class=\"muted\">The page you requested does not exist.</p>"
+      "</div>"));
+    send_html_foot();
   });
 
   web_server.begin();
@@ -986,6 +1334,7 @@ void sml_data( char *data, size_t len ) {
       last_uptime = itron.uptime;
       last_aPlus = itron.aPlus;
       last_aMinus = itron.aMinus;
+      update_period_baselines();
     }
   }
 

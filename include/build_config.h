@@ -1,10 +1,10 @@
-/* Defaults from platformio.ini build_flags - Generated on 2026-02-05 */
+/* Defaults from platformio.ini build_flags - Generated on 2026-04-29 */
 
 #ifndef ELECTRICITYMETER_BUILD_CONFIG_H
 #define ELECTRICITYMETER_BUILD_CONFIG_H
 
 #ifndef VERSION
-#define VERSION "8.2"
+#define VERSION "9.1"
 #endif
 
 #ifndef PROGNAME
