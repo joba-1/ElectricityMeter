@@ -953,7 +953,7 @@ void setup_webserver() {
       && thismonth_start.valid && lastmonth_start.valid
       && thisyear_start.valid && lastyear_start.valid;
     web_server.sendContent_P(PSTR(
-      "<div class=\"card\"><h2 class=\"cap\">Consumption (kWh)</h2>"
+      "<div class=\"card\"><h2 class=\"cap\">Consumption</h2>"
       "<table><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
     emit_period_row("Today",      "today",     &now_period,      &today_start);
     emit_period_row("Yesterday",  "yesterday", &today_start,     &yesterday_start);
