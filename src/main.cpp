@@ -1423,16 +1423,23 @@ void sml_data( char *data, size_t len ) {
   static uint64_t last_aPlus = 0;
   static uint64_t last_aMinus = 0;
   static uint8_t  backwards_count = 0;
+  static uint32_t stat_total          = 0;  // readings since last periodic report
+  static uint32_t stat_accepted       = 0;
+  static uint32_t stat_backwards      = 0;
+  static uint32_t stat_backwards_runs = 0;  // separate backwards runs
+  static uint32_t stat_max_bw_run     = 0;  // longest backwards run (lumping)
+  static uint32_t stat_power          = 0;
 
   sml_len = min(len, (size_t)sizeof(sml_raw));
   memcpy(sml_raw, data, sml_len);
-  
+
   memset(&itron, 0, sizeof(itron));
   read_sml(&itron, data, 0xffff, 0);
   if( itron.valid == 0x3f ) {
     recv_time = time(NULL);
     recv_detailed = itron.detailed;
-    
+    stat_total++;
+
     // Validate readings are within configured power limits
     if( last_uptime > 0 ) {
       if( itron.aPlus < last_aPlus || itron.aMinus < last_aMinus ) {
@@ -1440,7 +1447,14 @@ void sml_data( char *data, size_t len ) {
         // a genuine meter reset after power loss (sustained run of backwards values).
         // Only declare a reset after 5 consecutive backwards readings so isolated
         // read errors are silently dropped without disturbing the baselines.
-        if( ++backwards_count >= 5 ) {
+        ++backwards_count;
+        stat_backwards++;
+        if( backwards_count == 1 ) stat_backwards_runs++;  // new run started
+        if( backwards_count > stat_max_bw_run ) stat_max_bw_run = backwards_count;
+        syslog.logf(LOG_NOTICE,
+          "Backwards #%u: A+=%llu (was %llu) A-=%llu (was %llu)",
+          backwards_count, itron.aPlus, last_aPlus, itron.aMinus, last_aMinus);
+        if( backwards_count >= 5 ) {
           syslog.logf(LOG_WARNING,
             "Meter reset confirmed after %u backwards readings, new baseline A+=%llu A-=%llu",
             backwards_count, itron.aPlus, itron.aMinus);
@@ -1458,13 +1472,19 @@ void sml_data( char *data, size_t len ) {
         if( delta_time_s > 0 ) {
           bool valid = true;
           if( !is_power_valid(itron.aPlus, last_aPlus, delta_time_s, true) ) {
-            syslog.logf(LOG_WARNING, "Rejected: A+ delta=%llu in %u s exceeds USAGE_KW_MAX=%u",
-                        itron.aPlus - last_aPlus, delta_time_s, USAGE_KW_MAX);
+            uint64_t delta = itron.aPlus - last_aPlus;
+            syslog.logf(LOG_WARNING,
+              "Rejected: A+ delta=%llu/10 Wh in %u s = %.2f kW, limit=%u kW",
+              delta, delta_time_s, delta * 0.36 / delta_time_s, USAGE_KW_MAX);
+            stat_power++;
             valid = false;
           }
           if( !is_power_valid(itron.aMinus, last_aMinus, delta_time_s, false) ) {
-            syslog.logf(LOG_WARNING, "Rejected: A- delta=%llu in %u s exceeds PROD_KW_MAX=%u",
-                        itron.aMinus - last_aMinus, delta_time_s, PROD_KW_MAX);
+            uint64_t delta = itron.aMinus - last_aMinus;
+            syslog.logf(LOG_WARNING,
+              "Rejected: A- delta=%llu/10 Wh in %u s = %.2f kW, limit=%u kW",
+              delta, delta_time_s, delta * 0.36 / delta_time_s, PROD_KW_MAX);
+            stat_power++;
             valid = false;
           }
           if( !valid ) {
@@ -1473,9 +1493,10 @@ void sml_data( char *data, size_t len ) {
         }
       }
     }
-    
+
     // Store current values for next comparison (only if reading was valid)
     if( itron.valid == 0x3f ) {
+      stat_accepted++;
       last_uptime = itron.uptime;
       last_aPlus = itron.aPlus;
       last_aMinus = itron.aMinus;
@@ -1490,13 +1511,17 @@ void sml_data( char *data, size_t len ) {
   count++;
   if( count > max_count ) {
     count = 0;
+    syslog.logf(LOG_NOTICE,
+      "Stats: %u readings, %u accepted, %u backwards (%u runs, max %u in a row), %u power-rejected",
+      stat_total, stat_accepted, stat_backwards, stat_backwards_runs, stat_max_bw_run, stat_power);
+    stat_total = stat_accepted = stat_backwards = stat_backwards_runs = stat_max_bw_run = stat_power = 0;
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
       post_data();
       #ifdef DTU_TOPIC
       publish_data();
       #endif
       if( recv_detailed ) {
-        syslog.logf(LOG_INFO, "Itron %s", itronString(&itron));
+        syslog.logf(LOG_NOTICE, "Itron %s", itronString(&itron));
       }
       else {
         syslog.logf(LOG_WARNING, "Itron %s", itronString(&itron));
