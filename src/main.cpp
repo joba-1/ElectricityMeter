@@ -137,8 +137,16 @@ static WledColorState wled_green  = {};
 static WledColorState wled_blue   = {};
 static WledColorState wled_violet = {};
 static uint32_t wled_last_log_ms  = 0;
-static const uint32_t WLED_PEND_MS = 2 * 60 * 1000UL;  // 2 min pending before applying
-static const uint32_t WLED_HYST_W  = 400;               // exit hysteresis (W)
+struct WledCondConfig {
+  uint32_t threshold_w;  // entry threshold (W); unused for violet
+  uint32_t hyst_w;       // exit hysteresis (W); unused for violet
+  uint32_t pend_ms;      // entry and exit gate duration
+  uint8_t  r, g, b;     // LED color
+};
+static WledCondConfig cfg_red    = {WLED_CONSUMPTION_HIGH,  400, 2*60*1000, WLED_BRIGHTNESS, 0,              0             };
+static WledCondConfig cfg_green  = {WLED_BACKFEED_TOO_HIGH, 400, 2*60*1000, 0,              WLED_BRIGHTNESS, 0             };
+static WledCondConfig cfg_blue   = {WLED_BACKFEED_GOOD,     400, 2*60*1000, 0,              0,              WLED_BRIGHTNESS};
+static WledCondConfig cfg_violet = {0,                      0,   2*60*1000, 25,             0,              50            };
 
 static const char *wled_active_color_name() {
   if( wled_green.active  ) return "green";
@@ -584,6 +592,19 @@ static const char css_block[] PROGMEM =
   "footer{text-align:center;padding:1rem;color:#8b949e;font-size:.8rem}"
   "footer a{color:#8b949e}"
   "p{margin:.5rem 0}"
+  "fieldset{border:1px solid #30363d;border-radius:6px;padding:.75rem;margin-bottom:.75rem}"
+  "legend{color:#58a6ff;font-size:.9rem;padding:0 .4rem}"
+  ".frow{display:flex;gap:.75rem 1.5rem;flex-wrap:wrap;align-items:center;margin:.4rem 0}"
+  ".frow label{color:#8b949e;font-size:.85rem;white-space:nowrap}"
+  ".frow span{display:flex;align-items:center;gap:.4rem}"
+  "input[type=number]{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+                     "color:#c9d1d9;padding:.3rem .5rem;width:6rem}"
+  "input[type=color]{border:1px solid #30363d;border-radius:4px;padding:.1rem;"
+                    "cursor:pointer;height:2rem;width:3rem;background:#0d1117}"
+  "input[type=submit]{background:#1f6feb;border:1px solid #388bfd;border-radius:6px;"
+                     "color:#fff;padding:.5rem 1.2rem;cursor:pointer;font-size:.9rem;"
+                     "font-family:inherit}"
+  "input[type=submit]:hover{background:#388bfd}"
   "</style>";
 
 void send_html_head( int status, const char *meta_refresh ) {
@@ -609,6 +630,9 @@ void send_nav( const char *active ) {
     "<nav>"
     "<a href=\"/\"%s>Home</a>"
     "<a href=\"/monitor\"%s>Monitor</a>"
+#ifdef WLED_LEDS
+    "<a href=\"/wled\"%s>WLED</a>"
+#endif
     "<a href=\"/json\" target=\"_blank\">JSON</a>"
     "<a href=\"/sml\">SML</a>"
     "<form method=\"post\" action=\"/reset\" class=\"right\" "
@@ -617,7 +641,11 @@ void send_nav( const char *active ) {
     "</form>"
     "</nav><main>"),
     strcmp(active, "home")    == 0 ? " class=\"active\"" : "",
-    strcmp(active, "monitor") == 0 ? " class=\"active\"" : "");
+    strcmp(active, "monitor") == 0 ? " class=\"active\"" : ""
+#ifdef WLED_LEDS
+    , strcmp(active, "wled") == 0 ? " class=\"active\"" : ""
+#endif
+    );
   web_server.sendContent(web_buf);
 }
 
@@ -749,14 +777,14 @@ void update_power() {
 // Advance one per-color state machine: 2-min entry gate, 2-min exit gate with hysteresis.
 // Logs at LOG_INFO on pending start, LOG_NOTICE on activation/deactivation.
 static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_cond,
-                               uint32_t now_ms, const char *name) {
+                               uint32_t now_ms, uint32_t pend_ms, const char *name) {
   if( !st.active ) {
     if( entry_cond ) {
       // Above threshold: advance entry timer, cancel the cancel-timer.
       if( !st.enter_ms ) {
         st.enter_ms = now_ms;
         syslog.logf(LOG_INFO, "WLED %s pending on", name);
-      } else if( now_ms - st.enter_ms >= WLED_PEND_MS ) {
+      } else if( now_ms - st.enter_ms >= pend_ms ) {
         st.active   = true;
         st.enter_ms = 0;
         st.exit_ms  = 0;
@@ -768,7 +796,7 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
       // enter_ms is frozen (not reset) until cancel-timer fires.
       if( !st.exit_ms ) {
         st.exit_ms = now_ms;
-      } else if( now_ms - st.exit_ms >= WLED_PEND_MS ) {
+      } else if( now_ms - st.exit_ms >= pend_ms ) {
         if( st.enter_ms ) syslog.logf(LOG_INFO, "WLED %s pending on cancelled", name);
         st.enter_ms = 0;
         st.exit_ms  = 0;
@@ -783,7 +811,7 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
       if( !st.exit_ms ) {
         st.exit_ms = now_ms;
         syslog.logf(LOG_INFO, "WLED %s pending off", name);
-      } else if( now_ms - st.exit_ms >= WLED_PEND_MS ) {
+      } else if( now_ms - st.exit_ms >= pend_ms ) {
         st.active  = false;
         st.exit_ms = 0;
         syslog.logf(LOG_NOTICE, "WLED %s off", name);
@@ -814,17 +842,17 @@ void send_wled() {
   // Each color: entry condition (above threshold) / exit condition (below threshold - hysteresis).
   // Using "value + HYST < threshold" avoids unsigned underflow.
   wled_update_state(wled_red,
-    aPlusW  > WLED_CONSUMPTION_HIGH,
-    aPlusW  + WLED_HYST_W < WLED_CONSUMPTION_HIGH,
-    now_ms, "red");
+    aPlusW  > cfg_red.threshold_w,
+    aPlusW  + cfg_red.hyst_w < cfg_red.threshold_w,
+    now_ms, cfg_red.pend_ms, "red");
   wled_update_state(wled_green,
-    aMinusW > WLED_BACKFEED_TOO_HIGH,
-    aMinusW + WLED_HYST_W < WLED_BACKFEED_TOO_HIGH,
-    now_ms, "green");
+    aMinusW > cfg_green.threshold_w,
+    aMinusW + cfg_green.hyst_w < cfg_green.threshold_w,
+    now_ms, cfg_green.pend_ms, "green");
   wled_update_state(wled_blue,
-    aMinusW > WLED_BACKFEED_GOOD,
-    aMinusW + WLED_HYST_W < WLED_BACKFEED_GOOD,
-    now_ms, "blue");
+    aMinusW > cfg_blue.threshold_w,
+    aMinusW + cfg_blue.hyst_w < cfg_blue.threshold_w,
+    now_ms, cfg_blue.pend_ms, "blue");
 
   // Violet: daytime + any error condition (no meter/DB/MQTT for their respective timeouts)
   bool daytime = false;
@@ -843,11 +871,12 @@ void send_wled() {
   wled_update_state(wled_violet,
     daytime && any_error,
     !daytime || !any_error,
-    now_ms, "violet");
+    now_ms, cfg_violet.pend_ms, "violet");
 
   // Log countdown once per minute while any meaningful pending transition exists
   if( now_ms - wled_last_log_ms >= 60000 ) {
     const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+    const WledCondConfig *cc[] = {&cfg_red,  &cfg_green,  &cfg_blue,  &cfg_violet};
     const char *cn[]           = {"red", "green", "blue", "violet"};
     char buf[80] = "";
     size_t bl = 0;
@@ -857,7 +886,7 @@ void send_wled() {
       bool pend_off =  cs[i]->active && cs[i]->exit_ms;
       if( !pend_on && !pend_off ) continue;
       uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
-      int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+      int32_t rem = (int32_t)(cc[i]->pend_ms - (now_ms - pms)) / 1000;
       if( rem <= 0 ) continue;
       bl += snprintf(buf + bl, sizeof(buf) - bl, "%s%s%s in %d s",
         bl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
@@ -868,10 +897,10 @@ void send_wled() {
 
   // Priority resolution: green > red > blue > violet
   uint8_t r = 0, g = 0, b = 0;
-  if(      wled_green.active  ) { g = wled_brightness; }
-  else if( wled_red.active    ) { r = wled_brightness; }
-  else if( wled_blue.active   ) { b = wled_brightness; }
-  else if( wled_violet.active ) { r = 25; b = 50; }
+  if(      wled_green.active  ) { r = cfg_green.r;  g = cfg_green.g;  b = cfg_green.b;  }
+  else if( wled_red.active    ) { r = cfg_red.r;    g = cfg_red.g;    b = cfg_red.b;    }
+  else if( wled_blue.active   ) { r = cfg_blue.r;   g = cfg_blue.g;   b = cfg_blue.b;   }
+  else if( wled_violet.active ) { r = cfg_violet.r; g = cfg_violet.g; b = cfg_violet.b; }
 
   // Track color changes for the home page
   if( wled_r != r || wled_g != g || wled_b != b ) {
@@ -1006,13 +1035,14 @@ void send_main_page() {
     char pend[100] = "";
     size_t pl = 0;
     const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+    const WledCondConfig *cc[] = {&cfg_red,  &cfg_green,  &cfg_blue,  &cfg_violet};
     const char *cn[]           = {"red", "green", "blue", "violet"};
     for( int i = 0; i < 4; i++ ) {
       bool pend_on  = !cs[i]->active && cs[i]->enter_ms;
       bool pend_off =  cs[i]->active && cs[i]->exit_ms;
       if( !pend_on && !pend_off ) continue;
       uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
-      int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+      int32_t rem = (int32_t)(cc[i]->pend_ms - (now_ms - pms)) / 1000;
       if( rem < 0 ) rem = 0;
       pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
         pl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
@@ -1075,13 +1105,14 @@ void setup_webserver() {
       char pend[100] = "";
       size_t pl = 0;
       const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+      const WledCondConfig *cc[] = {&cfg_red,  &cfg_green,  &cfg_blue,  &cfg_violet};
       const char *cn[]           = {"red", "green", "blue", "violet"};
       for( int i = 0; i < 4; i++ ) {
         bool pend_on  = !cs[i]->active && cs[i]->enter_ms;
         bool pend_off =  cs[i]->active && cs[i]->exit_ms;
         if( !pend_on && !pend_off ) continue;
         uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
-        int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+        int32_t rem = (int32_t)(cc[i]->pend_ms - (now_ms - pms)) / 1000;
         if( rem < 0 ) rem = 0;
         pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
           pl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
@@ -1193,6 +1224,110 @@ void setup_webserver() {
     web_server.sendContent_P(poll_script);
     send_html_foot();
   });
+
+#ifdef WLED_LEDS
+  // WLED settings page
+  web_server.on("/wled", []() {
+    if( web_server.method() == HTTP_POST ) {
+      auto getU32 = [](const char *key, uint32_t cur) -> uint32_t {
+        return web_server.hasArg(key) ? (uint32_t)web_server.arg(key).toInt() : cur;
+      };
+      auto parseRGB = [](const char *key, uint8_t &r, uint8_t &g, uint8_t &b) {
+        if( !web_server.hasArg(key) ) return;
+        String v = web_server.arg(key);
+        if( v.length() < 7 ) return;
+        char h[3] = {0};
+        h[0]=v[1];h[1]=v[2]; r=(uint8_t)strtol(h,nullptr,16);
+        h[0]=v[3];h[1]=v[4]; g=(uint8_t)strtol(h,nullptr,16);
+        h[0]=v[5];h[1]=v[6]; b=(uint8_t)strtol(h,nullptr,16);
+      };
+      cfg_green.threshold_w  = getU32("green_limit", cfg_green.threshold_w);
+      cfg_green.hyst_w       = getU32("green_hyst",  cfg_green.hyst_w);
+      cfg_green.pend_ms      = getU32("green_delay",  cfg_green.pend_ms/1000) * 1000;
+      parseRGB("green_color", cfg_green.r, cfg_green.g, cfg_green.b);
+      cfg_blue.threshold_w   = getU32("blue_limit",  cfg_blue.threshold_w);
+      cfg_blue.hyst_w        = getU32("blue_hyst",   cfg_blue.hyst_w);
+      cfg_blue.pend_ms       = getU32("blue_delay",   cfg_blue.pend_ms/1000) * 1000;
+      parseRGB("blue_color",  cfg_blue.r,  cfg_blue.g,  cfg_blue.b);
+      cfg_red.threshold_w    = getU32("red_limit",   cfg_red.threshold_w);
+      cfg_red.hyst_w         = getU32("red_hyst",    cfg_red.hyst_w);
+      cfg_red.pend_ms        = getU32("red_delay",    cfg_red.pend_ms/1000) * 1000;
+      parseRGB("red_color",   cfg_red.r,   cfg_red.g,   cfg_red.b);
+      cfg_violet.pend_ms     = getU32("violet_delay", cfg_violet.pend_ms/1000) * 1000;
+      parseRGB("violet_color",cfg_violet.r,cfg_violet.g,cfg_violet.b);
+      syslog.logf(LOG_NOTICE, "WLED cfg: green>%uW hyst%u d%us, blue>%uW hyst%u d%us, red>%uW hyst%u d%us, violet d%us",
+        cfg_green.threshold_w, cfg_green.hyst_w, cfg_green.pend_ms/1000,
+        cfg_blue.threshold_w,  cfg_blue.hyst_w,  cfg_blue.pend_ms/1000,
+        cfg_red.threshold_w,   cfg_red.hyst_w,   cfg_red.pend_ms/1000,
+        cfg_violet.pend_ms/1000);
+      web_server.sendHeader("Location", "/wled");
+      web_server.send(303, "text/plain", "");
+      return;
+    }
+    // Build hex color strings for the form
+    char c_green[8], c_blue[8], c_red[8], c_violet[8];
+    snprintf(c_green,  sizeof(c_green),  "#%02x%02x%02x", cfg_green.r,  cfg_green.g,  cfg_green.b);
+    snprintf(c_blue,   sizeof(c_blue),   "#%02x%02x%02x", cfg_blue.r,   cfg_blue.g,   cfg_blue.b);
+    snprintf(c_red,    sizeof(c_red),    "#%02x%02x%02x", cfg_red.r,    cfg_red.g,    cfg_red.b);
+    snprintf(c_violet, sizeof(c_violet), "#%02x%02x%02x", cfg_violet.r, cfg_violet.g, cfg_violet.b);
+
+    send_html_head(200, NULL);
+    send_nav("wled");
+    web_server.sendContent_P(PSTR("<div class=\"card\"><h2>WLED Settings</h2>"
+      "<form method=\"post\" action=\"/wled\">"));
+
+    // Green
+    snprintf(web_buf, sizeof(web_buf),
+      "<fieldset><legend>Green &mdash; excess production (A&minus; &gt; limit)</legend>"
+      "<div class=\"frow\">"
+      "<span><label>Limit (W)</label><input type=\"number\" name=\"green_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
+      "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"green_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
+      "<span><label>Delay (s)</label><input type=\"number\" name=\"green_delay\" value=\"%u\" min=\"0\" max=\"3600\"></span>"
+      "<span><label>Color</label><input type=\"color\" name=\"green_color\" value=\"%s\"></span>"
+      "</div></fieldset>",
+      cfg_green.threshold_w, cfg_green.hyst_w, cfg_green.pend_ms/1000, c_green);
+    web_server.sendContent(web_buf);
+
+    // Blue
+    snprintf(web_buf, sizeof(web_buf),
+      "<fieldset><legend>Blue &mdash; selling to grid (A&minus; &gt; limit)</legend>"
+      "<div class=\"frow\">"
+      "<span><label>Limit (W)</label><input type=\"number\" name=\"blue_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
+      "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"blue_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
+      "<span><label>Delay (s)</label><input type=\"number\" name=\"blue_delay\" value=\"%u\" min=\"0\" max=\"3600\"></span>"
+      "<span><label>Color</label><input type=\"color\" name=\"blue_color\" value=\"%s\"></span>"
+      "</div></fieldset>",
+      cfg_blue.threshold_w, cfg_blue.hyst_w, cfg_blue.pend_ms/1000, c_blue);
+    web_server.sendContent(web_buf);
+
+    // Red
+    snprintf(web_buf, sizeof(web_buf),
+      "<fieldset><legend>Red &mdash; high demand (A+ &gt; limit)</legend>"
+      "<div class=\"frow\">"
+      "<span><label>Limit (W)</label><input type=\"number\" name=\"red_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
+      "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"red_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
+      "<span><label>Delay (s)</label><input type=\"number\" name=\"red_delay\" value=\"%u\" min=\"0\" max=\"3600\"></span>"
+      "<span><label>Color</label><input type=\"color\" name=\"red_color\" value=\"%s\"></span>"
+      "</div></fieldset>",
+      cfg_red.threshold_w, cfg_red.hyst_w, cfg_red.pend_ms/1000, c_red);
+    web_server.sendContent(web_buf);
+
+    // Violet
+    snprintf(web_buf, sizeof(web_buf),
+      "<fieldset><legend>Violet &mdash; errors (daytime only)</legend>"
+      "<div class=\"frow\">"
+      "<span><label>Delay (s)</label><input type=\"number\" name=\"violet_delay\" value=\"%u\" min=\"0\" max=\"3600\"></span>"
+      "<span><label>Color</label><input type=\"color\" name=\"violet_color\" value=\"%s\"></span>"
+      "</div></fieldset>",
+      cfg_violet.pend_ms/1000, c_violet);
+    web_server.sendContent(web_buf);
+
+    web_server.sendContent_P(PSTR(
+      "<div class=\"frow\"><input type=\"submit\" value=\"Apply\"></div>"
+      "</form></div>"));
+    send_html_foot();
+  });
+#endif
 
   // Index page
   web_server.on("/", []() {
