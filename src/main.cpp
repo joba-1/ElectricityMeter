@@ -126,77 +126,6 @@ uint8_t wled_g = 0;
 uint8_t wled_b = 0;
 uint32_t wled_update = 0;  // ms of last udp packet
 uint32_t wled_change = 0;  // ms of last color change
-
-void send_wled() {
-  static uint32_t uptime = 0;
-  static uint64_t aPlus = 0;
-  static uint64_t aMinus = 0;
-  static bool isOn = false;  // for on/off hysteresis
-  
-  uint64_t aPlusW = 0;
-  uint64_t aMinusW = 0;
-
-  if( itron.valid == 0x3f ) {
-    if( uptime != itron.uptime && (itron.aPlus != aPlus || itron.aMinus != aMinus) ) {
-      if( uptime ) {
-        aPlusW = (itron.aPlus - aPlus) * 360 / (itron.uptime - uptime);
-        aMinusW = (itron.aMinus - aMinus) * 360 / (itron.uptime - uptime);
-      }
-      
-      uptime = itron.uptime;
-      aPlus = itron.aPlus;
-      aMinus = itron.aMinus;
-
-      uint8_t r = 0, g = 0, b = 0;
-      if( aPlusW > WLED_CONSUMPTION_HIGH ) {
-        r = 0xff, b = 0x22;  // red warning on high load
-        isOn = false;
-      }
-      else if( aMinusW > WLED_BACKFEED_TOO_HIGH ) {
-        b = 0xff;  // too high back feed: blue
-        isOn = true;
-      }
-      else if( aMinusW > WLED_BACKFEED_VERY_HIGH ) {
-        g = 0xff; b = 0xff;  // very high back feed: cyan
-        isOn = true;
-      }
-      else if( (isOn and (aPlusW == 0 || aMinusW > 0)) || aMinusW > WLED_BACKFEED_GOOD ) {
-        g = 0xff; // good back feed: green
-        isOn = true;
-      }
-      else {
-        isOn = false;
-      }
-      
-      if( isOn ) {
-        r = (uint16_t)wled_brightness * r / 255;
-        g = (uint16_t)wled_brightness * g / 255;
-        b = (uint16_t)wled_brightness * b / 255;
-      }
-
-      // syslog.logf(LOG_NOTICE, "wled: A+ %llu W, A- %llu W -> rgb %u,%u,%u", aPlusW, aMinusW, r, g, b);
-
-      if( (r || g || b) && wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
-        wledUDP.write(2);  // WLED proto DRGB
-        wledUDP.write(wled_secs);  // hold color for some seconds
-        int led = WLED_LEDS;
-        while( led-- ) {
-          wledUDP.write(r);
-          wledUDP.write(g);
-          wledUDP.write(b);
-        }
-        wledUDP.endPacket();
-        wled_update = millis();
-        if( wled_r != r || wled_g != g || wled_b != b ) {
-          wled_change = wled_update;
-          wled_r = r;
-          wled_g = g;
-          wled_b = b;
-        }
-      }
-    }
-  }
-}
 #endif
 
 #ifdef DTU_TOPIC
@@ -208,10 +137,11 @@ const char topic_name[] =      DTU_TOPIC "/" INVERTER_SERIAL "/name";
 const char topic_limit[] =     DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
 const char topic_reachable[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/reachable";
 const char topic_dynamic[] =   DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_dynamic";
-char inverter[80] = "?";  
+char inverter[80] = "?";
 uint16_t curr_limit = UINT16_MAX;
 bool reachable = false;
 bool dynamic = false;
+time_t last_mqtt_ok = 0;  // wall time of last confirmed broker connection
 
 /*
 Send MQTT request to change power limit if it changed
@@ -372,6 +302,7 @@ void handle_mqtt() {
   static char msg[128];
 
   if (mqtt.connected()) {
+    last_mqtt_ok = time(NULL);
     mqtt.loop();
   }
   else {
@@ -781,6 +712,87 @@ void update_power() {
     minus_ticks = 0;
   }
 }
+
+#ifdef WLED_LEDS
+void send_wled() {
+  static uint32_t last_send_ms = 0;
+  uint32_t now_ms = millis();
+
+  // Rate-limit to just under the WLED hold time so the color stays alive
+  if( now_ms - last_send_ms < (uint32_t)(wled_secs - 1) * 1000 ) return;
+
+  time_t now = time(NULL);
+  bool valid_time = (now > 1000000000UL);
+
+  uint8_t r = 0, g = 0, b = 0;
+
+  // Normal operation: use live_power (same values as the web display).
+  // Priority: red (high load) > green (excess production) > blue (selling).
+  if( meter_seen && live_power.uptime != 0 ) {
+    uint64_t aPlusW  = live_power.aPlusW  / 10;  // convert 1/10 W → W
+    uint64_t aMinusW = live_power.aMinusW / 10;
+
+    if( aPlusW > WLED_CONSUMPTION_HIGH ) {
+      r = 0xff;  // medium red: high consumption (>WLED_CONSUMPTION_HIGH W)
+    }
+    else if( aMinusW > WLED_BACKFEED_TOO_HIGH ) {
+      g = 0xff;  // medium green: excess production, can't sell all (>WLED_BACKFEED_TOO_HIGH W)
+    }
+    else if( aMinusW > WLED_BACKFEED_GOOD ) {
+      b = 0xff;  // medium blue: selling to grid (>WLED_BACKFEED_GOOD W)
+    }
+
+    if( r || g || b ) {
+      r = (uint16_t)wled_brightness * r / 255;
+      g = (uint16_t)wled_brightness * g / 255;
+      b = (uint16_t)wled_brightness * b / 255;
+    }
+  }
+
+  // Error state: dark violet during daytime when data or connections are stale.
+  // Requires valid NTP time so the daytime check is meaningful.
+  if( !(r || g || b) && valid_time ) {
+    struct tm t;
+    localtime_r(&now, &t);
+    bool daytime = (t.tm_hour >= WLED_DAY_START && t.tm_hour < WLED_DAY_END);
+
+    if( daytime ) {
+      // No valid meter readings in the last 5 minutes
+      bool no_meter  = (recv_time == 0 || now - recv_time > 300);
+      // InfluxDB hasn't accepted a post in 30 minutes (0 = not posted yet, skip)
+      bool no_db     = (post_time > 0 && now - post_time > 1800);
+      // MQTT broker unreachable for 30 minutes (0 = never connected, skip)
+      bool no_broker = false;
+#ifdef DTU_TOPIC
+      no_broker = (last_mqtt_ok > 0 && now - last_mqtt_ok > 1800);
+#endif
+      if( no_meter || no_db || no_broker ) {
+        r = 25; g = 0; b = 50;  // dark violet
+      }
+    }
+  }
+
+  if( r || g || b ) {
+    if( wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
+      wledUDP.write(2);  // WLED proto DRGB
+      wledUDP.write(wled_secs);
+      int led = WLED_LEDS;
+      while( led-- ) {
+        wledUDP.write(r);
+        wledUDP.write(g);
+        wledUDP.write(b);
+      }
+      wledUDP.endPacket();
+      last_send_ms = now_ms;
+      wled_update  = now_ms;
+      if( wled_r != r || wled_g != g || wled_b != b ) {
+        wled_change = now_ms;
+        wled_r = r; wled_g = g; wled_b = b;
+      }
+    }
+  }
+}
+#endif
 
 void send_power_card() {
   snprintf(web_buf, sizeof(web_buf),
@@ -1631,6 +1643,10 @@ void loop() {
 
 #ifdef DTU_TOPIC
   handle_mqtt();
+#endif
+
+#ifdef WLED_LEDS
+  send_wled();  // also called from sml_data; this covers the no-SML error state
 #endif
 
   web_server.handleClient();

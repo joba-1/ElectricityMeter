@@ -4,7 +4,7 @@
 #define ELECTRICITYMETER_BUILD_CONFIG_H
 
 #ifndef VERSION
-#define VERSION "9.7"
+#define VERSION "9.8"
 #endif
 
 #ifndef PROGNAME
@@ -52,19 +52,23 @@
 #endif
 
 #ifndef WLED_CONSUMPTION_HIGH
-#define WLED_CONSUMPTION_HIGH 4000
+#define WLED_CONSUMPTION_HIGH 4000   // W: medium red above this
 #endif
 
 #ifndef WLED_BACKFEED_TOO_HIGH
-#define WLED_BACKFEED_TOO_HIGH 99999
-#endif
-
-#ifndef WLED_BACKFEED_VERY_HIGH
-#define WLED_BACKFEED_VERY_HIGH 99999
+#define WLED_BACKFEED_TOO_HIGH 7000  // W: medium green above this (excess production)
 #endif
 
 #ifndef WLED_BACKFEED_GOOD
-#define WLED_BACKFEED_GOOD 200
+#define WLED_BACKFEED_GOOD 500       // W: medium blue above this (selling to grid)
+#endif
+
+#ifndef WLED_DAY_START
+#define WLED_DAY_START 7             // local hour: daytime begins (for dark-violet error state)
+#endif
+
+#ifndef WLED_DAY_END
+#define WLED_DAY_END 21              // local hour: daytime ends
 #endif
 
 #ifndef MQTT_BROKER
