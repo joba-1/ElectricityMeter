@@ -715,31 +715,33 @@ void update_power() {
 
 #ifdef WLED_LEDS
 void send_wled() {
-  static uint32_t last_send_ms = 0;
-  uint32_t now_ms = millis();
+  static uint32_t last_send_ms  = 0;
+  static uint8_t  cand_r = 0, cand_g = 0, cand_b = 0;  // target color right now
+  static uint32_t cand_since_ms = 0;                     // when target last changed
+  static uint8_t  active_r = 0, active_g = 0, active_b = 0;  // confirmed stable color
 
-  // Rate-limit to just under the WLED hold time so the color stays alive
-  if( now_ms - last_send_ms < (uint32_t)(wled_secs - 1) * 1000 ) return;
+  const uint32_t stable_ms = 5 * 60 * 1000;  // must hold for 5 min before applying
+  uint32_t now_ms = millis();
 
   time_t now = time(NULL);
   bool valid_time = (now > 1000000000UL);
 
+  // Determine the target color from current conditions.
+  // Priority: red (high load) > green (excess production) > blue (selling) > dark violet (error).
   uint8_t r = 0, g = 0, b = 0;
 
-  // Normal operation: use live_power (same values as the web display).
-  // Priority: red (high load) > green (excess production) > blue (selling).
   if( meter_seen && live_power.uptime != 0 ) {
     uint64_t aPlusW  = live_power.aPlusW  / 10;  // convert 1/10 W → W
     uint64_t aMinusW = live_power.aMinusW / 10;
 
     if( aPlusW > WLED_CONSUMPTION_HIGH ) {
-      r = 0xff;  // medium red: high consumption (>WLED_CONSUMPTION_HIGH W)
+      r = 0xff;  // medium red: high consumption
     }
     else if( aMinusW > WLED_BACKFEED_TOO_HIGH ) {
-      g = 0xff;  // medium green: excess production, can't sell all (>WLED_BACKFEED_TOO_HIGH W)
+      g = 0xff;  // medium green: excess production, can't sell all
     }
     else if( aMinusW > WLED_BACKFEED_GOOD ) {
-      b = 0xff;  // medium blue: selling to grid (>WLED_BACKFEED_GOOD W)
+      b = 0xff;  // medium blue: selling to grid
     }
 
     if( r || g || b ) {
@@ -755,13 +757,9 @@ void send_wled() {
     struct tm t;
     localtime_r(&now, &t);
     bool daytime = (t.tm_hour >= WLED_DAY_START && t.tm_hour < WLED_DAY_END);
-
     if( daytime ) {
-      // No valid meter readings in the last 5 minutes
       bool no_meter  = (recv_time == 0 || now - recv_time > 300);
-      // InfluxDB hasn't accepted a post in 30 minutes (0 = not posted yet, skip)
       bool no_db     = (post_time > 0 && now - post_time > 1800);
-      // MQTT broker unreachable for 30 minutes (0 = never connected, skip)
       bool no_broker = false;
 #ifdef DTU_TOPIC
       no_broker = (last_mqtt_ok > 0 && now - last_mqtt_ok > 1800);
@@ -772,22 +770,35 @@ void send_wled() {
     }
   }
 
-  if( r || g || b ) {
+  // Stability gate: only apply a color change after it has held for 5 minutes.
+  // This keeps brief load spikes or transient errors from flickering the display.
+  if( r != cand_r || g != cand_g || b != cand_b ) {
+    cand_r = r; cand_g = g; cand_b = b;
+    cand_since_ms = now_ms;
+  }
+  if( now_ms - cand_since_ms >= stable_ms ) {
+    active_r = cand_r; active_g = cand_g; active_b = cand_b;
+  }
+
+  // Rate-limit UDP sends to just under the WLED hold time.
+  if( now_ms - last_send_ms < (uint32_t)(wled_secs - 1) * 1000 ) return;
+
+  if( active_r || active_g || active_b ) {
     if( wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
       wledUDP.write(2);  // WLED proto DRGB
       wledUDP.write(wled_secs);
       int led = WLED_LEDS;
       while( led-- ) {
-        wledUDP.write(r);
-        wledUDP.write(g);
-        wledUDP.write(b);
+        wledUDP.write(active_r);
+        wledUDP.write(active_g);
+        wledUDP.write(active_b);
       }
       wledUDP.endPacket();
       last_send_ms = now_ms;
       wled_update  = now_ms;
-      if( wled_r != r || wled_g != g || wled_b != b ) {
+      if( wled_r != active_r || wled_g != active_g || wled_b != active_b ) {
         wled_change = now_ms;
-        wled_r = r; wled_g = g; wled_b = b;
+        wled_r = active_r; wled_g = active_g; wled_b = active_b;
       }
     }
   }
