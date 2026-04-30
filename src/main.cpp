@@ -696,7 +696,11 @@ void update_power() {
     return;
   }
   if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
-    return;  // safety net: sml_data should have caught this; skip to avoid underflow
+    // Anchor is ahead of current reading — reset so we re-init on the next call.
+    syslog.logf(LOG_WARNING, "Live power anchor reset: A+=%llu<%llu or A-=%llu<%llu",
+      itron.aPlus, live_power.aPlus, itron.aMinus, live_power.aMinus);
+    live_power = power_state_t{};
+    return;
   }
 
   // Detect new energy increments since the previous reading.
@@ -717,6 +721,13 @@ void update_power() {
   if( dt > 0 ) {
     live_power.aPlusW  = dPlus  * 3600 / dt;
     live_power.aMinusW = dMinus * 3600 / dt;
+    // Guard against impossible values (e.g. from dt being tiny due to uptime glitch).
+    uint64_t max_w = (uint64_t)max(USAGE_KW_MAX, PROD_KW_MAX) * 10000ULL;
+    if( live_power.aPlusW > max_w || live_power.aMinusW > max_w ) {
+      syslog.logf(LOG_WARNING, "Live power out of range: A+W=%llu A-W=%llu (1/10W); resetting",
+        live_power.aPlusW, live_power.aMinusW);
+      live_power = power_state_t{};
+    }
   }
 
   // Advance anchor after MIN_TICKS (adapts to load) or at the safety cap.
@@ -740,18 +751,31 @@ void update_power() {
 static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_cond,
                                uint32_t now_ms, const char *name) {
   if( !st.active ) {
-    st.exit_ms = 0;
     if( entry_cond ) {
+      // Above threshold: advance entry timer, cancel the cancel-timer.
       if( !st.enter_ms ) {
         st.enter_ms = now_ms;
         syslog.logf(LOG_INFO, "WLED %s pending on", name);
       } else if( now_ms - st.enter_ms >= WLED_PEND_MS ) {
         st.active   = true;
         st.enter_ms = 0;
+        st.exit_ms  = 0;
         syslog.logf(LOG_NOTICE, "WLED %s on", name);
       }
+      st.exit_ms = 0;  // reset cancel-timer while above entry threshold
+    } else if( exit_cond ) {
+      // Clearly below hysteresis threshold: run cancel-timer.
+      // enter_ms is frozen (not reset) until cancel-timer fires.
+      if( !st.exit_ms ) {
+        st.exit_ms = now_ms;
+      } else if( now_ms - st.exit_ms >= WLED_PEND_MS ) {
+        if( st.enter_ms ) syslog.logf(LOG_INFO, "WLED %s pending on cancelled", name);
+        st.enter_ms = 0;
+        st.exit_ms  = 0;
+      }
     } else {
-      st.enter_ms = 0;
+      // Hysteresis zone: freeze both timers — brief dips don't reset entry.
+      st.exit_ms = 0;
     }
   } else {
     st.enter_ms = 0;
@@ -765,7 +789,10 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
         syslog.logf(LOG_NOTICE, "WLED %s off", name);
       }
     } else {
-      st.exit_ms = 0;
+      if( st.exit_ms ) {
+        st.exit_ms = 0;
+        syslog.logf(LOG_INFO, "WLED %s pending off cancelled", name);
+      }
     }
   }
 }
@@ -799,32 +826,41 @@ void send_wled() {
     aMinusW + WLED_HYST_W < WLED_BACKFEED_GOOD,
     now_ms, "blue");
 
-  // Violet: daytime + no valid meter reading for 2 min (same gate as WLED_PEND_MS)
+  // Violet: daytime + any error condition (no meter/DB/MQTT for their respective timeouts)
   bool daytime = false;
-  bool no_meter = (recv_time == 0 || now_t - recv_time > 120);
+  bool no_meter  = (recv_time == 0 || now_t - recv_time > 120);
+  bool no_db     = (post_time > 0 && now_t - post_time > 1800);
+  bool no_broker = false;
+#ifdef DTU_TOPIC
+  no_broker = (last_mqtt_ok > 0 && now_t - last_mqtt_ok > 1800);
+#endif
+  bool any_error = no_meter || no_db || no_broker;
   if( valid_time ) {
     struct tm t;
     localtime_r(&now_t, &t);
     daytime = (t.tm_hour >= WLED_DAY_START && t.tm_hour < WLED_DAY_END);
   }
   wled_update_state(wled_violet,
-    daytime && no_meter,
-    !daytime || !no_meter,
+    daytime && any_error,
+    !daytime || !any_error,
     now_ms, "violet");
 
-  // Log countdown once per minute while any color is pending
+  // Log countdown once per minute while any meaningful pending transition exists
   if( now_ms - wled_last_log_ms >= 60000 ) {
     const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
     const char *cn[]           = {"red", "green", "blue", "violet"};
     char buf[80] = "";
     size_t bl = 0;
     for( int i = 0; i < 4; i++ ) {
-      uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
-      if( !pms ) continue;
+      // Only show: pending-on (not active + enter_ms) or pending-off (active + exit_ms)
+      bool pend_on  = !cs[i]->active && cs[i]->enter_ms;
+      bool pend_off =  cs[i]->active && cs[i]->exit_ms;
+      if( !pend_on && !pend_off ) continue;
+      uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
       int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
       if( rem <= 0 ) continue;
       bl += snprintf(buf + bl, sizeof(buf) - bl, "%s%s%s in %d s",
-        bl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
+        bl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
     }
     if( bl ) syslog.logf(LOG_INFO, "WLED pending: %s active, %s", wled_active_color_name(), buf);
     wled_last_log_ms = now_ms;
@@ -859,6 +895,9 @@ void send_wled() {
       wledUDP.endPacket();
       last_send_ms = now_ms;
       wled_update  = now_ms;
+      syslog.logf(LOG_INFO, "WLED UDP sent: %s rgb(%u,%u,%u)", wled_active_color_name(), r, g, b);
+    } else {
+      syslog.logf(LOG_WARNING, "WLED UDP beginPacket failed for %s:%d", WLED_HOST, WLED_PORT);
     }
   }
 }
@@ -969,12 +1008,14 @@ void send_main_page() {
     const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
     const char *cn[]           = {"red", "green", "blue", "violet"};
     for( int i = 0; i < 4; i++ ) {
-      uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
-      if( !pms ) continue;
+      bool pend_on  = !cs[i]->active && cs[i]->enter_ms;
+      bool pend_off =  cs[i]->active && cs[i]->exit_ms;
+      if( !pend_on && !pend_off ) continue;
+      uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
       int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
       if( rem < 0 ) rem = 0;
       pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
-        pl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
+        pl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
     }
     snprintf(web_buf, sizeof(web_buf),
       "<div class=\"card\"><h2>WLED</h2><table>"
@@ -1036,12 +1077,14 @@ void setup_webserver() {
       const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
       const char *cn[]           = {"red", "green", "blue", "violet"};
       for( int i = 0; i < 4; i++ ) {
-        uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
-        if( !pms ) continue;
+        bool pend_on  = !cs[i]->active && cs[i]->enter_ms;
+        bool pend_off =  cs[i]->active && cs[i]->exit_ms;
+        if( !pend_on && !pend_off ) continue;
+        uint32_t pms = pend_on ? cs[i]->enter_ms : cs[i]->exit_ms;
         int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
         if( rem < 0 ) rem = 0;
         pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
-          pl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
+          pl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
       }
       pos += snprintf(json + pos, sizeof(json) - pos,
         ",\"wled_color\":\"%s\",\"wled_pending\":%s%s%s",
