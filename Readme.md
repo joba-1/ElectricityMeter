@@ -24,7 +24,34 @@ dark-themed nav bar:
 ## Features
 
 ### Meter Reading Validation
-Readings are validated against configured maximum power thresholds (`PROD_KW_MAX`, `USAGE_KW_MAX`) to detect and reject anomalous data from the meter. If any reading exceeds the limits, the entire SML message is discarded as invalid.
+Readings are validated against configured maximum power thresholds (`PROD_KW_MAX`, `USAGE_KW_MAX`) to detect and reject anomalous data from the meter. If any reading exceeds the limits, the entire SML message is discarded as invalid. Rejected readings are never forwarded to InfluxDB, MQTT, WLED, or the live power display; the next reading is always compared against the last *accepted* baseline.
+
+Two classes of outlier are detected:
+
+**Backwards readings** — the A+ or A- counter is lower than the previous accepted value, which can indicate a transient bit error in the SML stream or a genuine meter reset after a power failure. Isolated bit errors are common and expected; a sustained run means the meter actually reset.
+
+**Power-limit spikes** — the energy delta between two consecutive readings implies a power level that exceeds the configured maximum, which is physically impossible and indicates a corrupt reading.
+
+#### Syslog messages
+
+Every message below is at `LOG_NOTICE` or higher and appears under the device hostname.
+
+| Message | Meaning |
+|---------|---------|
+| `Backwards #N: A+=X (was Y) A-=P (was Q)` | N-th consecutive backwards reading in the current run. X/P are the new (rejected) values; Y/Q are the last accepted values. A single `#1` followed by a normal reading is a harmless bit error. |
+| `Meter reset confirmed after N backwards readings, new baseline A+=X A-=Y` | N consecutive backwards readings were seen — interpreted as a genuine meter reset after power loss. The baseline is updated and the live power display is cleared. |
+| `Rejected: A+ delta=D/10 Wh in T s = K.KK kW, limit=L kW` | A+ energy jump of D/10 Wh over T seconds implies K.KK kW, exceeding the `USAGE_KW_MAX` limit of L kW. Reading discarded. |
+| `Rejected: A- delta=D/10 Wh in T s = K.KK kW, limit=L kW` | Same for A- (backfeed), compared against `PROD_KW_MAX`. |
+| `Stats: T readings, A accepted, B backwards (R runs, max M in a row), P power-rejected` | Periodic summary (~once per minute). T is total valid SML frames parsed; A accepted; B discarded as backwards across R separate runs with a longest run of M; P discarded for exceeding the power limit. |
+| `Itron valid=…` | Periodic confirmation of a good reading (once per minute). |
+
+#### Interpreting the Stats line
+
+- `B=0` — no outliers in the last minute, everything clean.
+- `B>0, R=B, max=1` — every backwards reading was isolated (one per run). Classic bit-error pattern, not a problem.
+- `B>0, max>1` — consecutive backwards readings in a cluster. Runs of 2–3 occasionally happen; 4 means one more would have triggered a meter-reset declaration.
+- `max≥5` — a meter reset was confirmed; check for a preceding `Meter reset confirmed` warning.
+- `P>0` — power-limit spikes occurred; inspect the individual `Rejected` lines to see how far the values exceeded the threshold. If the computed kW is only marginally above the limit, consider raising `USAGE_KW_MAX` / `PROD_KW_MAX`.
 
 ### WLED Visual Feedback
 Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).
