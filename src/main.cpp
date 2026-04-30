@@ -692,9 +692,14 @@ void emit_period_row( const char *label, const char *id, const period_t *cur, co
   web_server.sendContent(web_buf);
 }
 
-// Smoothed live power tracker. Updated only on validated SML readings, and
-// only when the integration window is at least POWER_WINDOW_S seconds long
-// so quantization noise from 1/10 Wh deltas doesn't make the displayed W jump.
+// Adaptive live power tracker.
+//
+// The anchor window grows until MIN_TICKS energy increments have accumulated,
+// then resets. At high load ticks arrive fast → short window → quick response
+// to switching large loads on/off. At low load ticks are rare → the window
+// spans multiple tick intervals → smooth average instead of spike-then-fade.
+// The displayed value is updated only on a new tick and held between ticks,
+// so the display is stable rather than fading toward zero.
 struct power_state_t {
   uint32_t uptime;
   uint64_t aPlus;
@@ -704,7 +709,12 @@ struct power_state_t {
 };
 
 static power_state_t live_power = {0, 0, 0, 0, 0};
-static const uint32_t POWER_WINDOW_S = 30;
+
+// Require this many counter increments before resetting the integration anchor.
+// High load → many ticks → fast resets → responsive. Low load → few ticks →
+// anchor stays long → smooth average. Max window caps the stale-display risk.
+static const uint32_t POWER_MIN_TICKS = 3;
+static const uint32_t POWER_MAX_WIN_S = 300;  // 5 min safety cap
 
 // Last meter readings from a validated SML message. Used for display so a
 // partial or rejected message that lands in the global itron doesn't make
@@ -714,28 +724,61 @@ static uint64_t latest_aMinus = 0;
 static bool     meter_seen    = false;
 
 void update_power() {
-  if( itron.valid != 0x3f ) return;  // skip rejected/incomplete readings
+  if( itron.valid != 0x3f ) return;
+
+  // Static state for tick counting; reinitialised when live_power is zeroed
+  // (e.g. after a meter reset detected in sml_data).
+  static uint64_t prev_aPlus   = 0;
+  static uint64_t prev_aMinus  = 0;
+  static uint32_t plus_ticks   = 0;
+  static uint32_t minus_ticks  = 0;
+
   if( live_power.uptime == 0 ) {
     live_power.uptime = itron.uptime;
     live_power.aPlus  = itron.aPlus;
     live_power.aMinus = itron.aMinus;
+    prev_aPlus   = itron.aPlus;
+    prev_aMinus  = itron.aMinus;
+    plus_ticks   = 0;
+    minus_ticks  = 0;
     return;
   }
   if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
     return;  // safety net: sml_data should have caught this; skip to avoid underflow
   }
-  uint32_t dt = itron.uptime - live_power.uptime;
-  if( dt >= POWER_WINDOW_S ) {
-    live_power.aPlusW  = (itron.aPlus  - live_power.aPlus)  * 3600 / dt;
-    live_power.aMinusW = (itron.aMinus - live_power.aMinus) * 3600 / dt;
-    // Only reset anchor when window exceeds 2x minimum — this keeps the window
-    // growing (and updating the display on every reading) rather than resetting
-    // to zero on each chunk boundary, which causes 0/72W toggling at low power.
-    if( dt >= 2 * POWER_WINDOW_S ) {
-      live_power.uptime = itron.uptime;
-      live_power.aPlus  = itron.aPlus;
-      live_power.aMinus = itron.aMinus;
-    }
+
+  // Detect new energy increments since the previous reading.
+  bool new_plus  = itron.aPlus  > prev_aPlus;
+  bool new_minus = itron.aMinus > prev_aMinus;
+  prev_aPlus  = itron.aPlus;
+  prev_aMinus = itron.aMinus;
+  if( new_plus  ) plus_ticks++;
+  if( new_minus ) minus_ticks++;
+
+  uint64_t dPlus  = itron.aPlus  - live_power.aPlus;
+  uint64_t dMinus = itron.aMinus - live_power.aMinus;
+  uint32_t dt     = itron.uptime - live_power.uptime;
+
+  // Always update displayed power so it naturally decays toward 0 when
+  // consumption drops. Because the anchor only resets on ticks (below), dt
+  // at the first tick of a new window is always meaningful — no more spikes.
+  if( dt > 0 ) {
+    live_power.aPlusW  = dPlus  * 3600 / dt;
+    live_power.aMinusW = dMinus * 3600 / dt;
+  }
+
+  // Advance anchor after MIN_TICKS (adapts to load) or at the safety cap.
+  // Resetting only on ticks ensures dt is never artificially small when the
+  // first tick of a new window arrives, eliminating the spike-then-fade artifact.
+  bool do_reset = (plus_ticks  >= POWER_MIN_TICKS)
+               || (minus_ticks >= POWER_MIN_TICKS)
+               || (dt >= POWER_MAX_WIN_S);
+  if( do_reset ) {
+    live_power.uptime = itron.uptime;
+    live_power.aPlus  = itron.aPlus;
+    live_power.aMinus = itron.aMinus;
+    plus_ticks  = 0;
+    minus_ticks = 0;
   }
 }
 

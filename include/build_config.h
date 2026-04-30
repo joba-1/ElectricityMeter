@@ -4,7 +4,7 @@
 #define ELECTRICITYMETER_BUILD_CONFIG_H
 
 #ifndef VERSION
-#define VERSION "9.5"
+#define VERSION "9.6"
 #endif
 
 #ifndef PROGNAME
