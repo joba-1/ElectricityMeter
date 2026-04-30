@@ -126,20 +126,26 @@ uint8_t wled_g = 0;
 uint8_t wled_b = 0;
 uint32_t wled_update = 0;  // ms of last udp packet
 uint32_t wled_change = 0;  // ms of last color change
-// Stability tracking (file-scope so /api/stats can read pending state)
-static uint8_t  wled_cand_r = 0, wled_cand_g = 0, wled_cand_b = 0;
-static uint32_t wled_cand_since_ms = 0;
-static uint8_t  wled_active_r = 0, wled_active_g = 0, wled_active_b = 0;
-static uint32_t wled_last_log_ms = 0;
-static const uint32_t WLED_STABLE_MS = 5 * 60 * 1000;
+// Per-color hysteresis state (file-scope so /api/stats can read pending state)
+struct WledColorState {
+  bool     active;
+  uint32_t enter_ms;  // when entry cond started; 0 = not pending entry
+  uint32_t exit_ms;   // when exit cond started;  0 = not pending exit
+};
+static WledColorState wled_red    = {};
+static WledColorState wled_green  = {};
+static WledColorState wled_blue   = {};
+static WledColorState wled_violet = {};
+static uint32_t wled_last_log_ms  = 0;
+static const uint32_t WLED_PEND_MS = 2 * 60 * 1000UL;  // 2 min pending before applying
+static const uint32_t WLED_HYST_W  = 400;               // exit hysteresis (W)
 
-static const char *wled_color_name(uint8_t r, uint8_t g, uint8_t b) {
-  if( !r && !g && !b ) return "off";
-  if(  r && !g && !b ) return "red";
-  if( !r &&  g && !b ) return "green";
-  if( !r && !g &&  b ) return "blue";
-  if(  r && !g &&  b ) return "violet";
-  return "?";
+static const char *wled_active_color_name() {
+  if( wled_green.active  ) return "green";
+  if( wled_red.active    ) return "red";
+  if( wled_blue.active   ) return "blue";
+  if( wled_violet.active ) return "violet";
+  return "off";
 }
 #endif
 
@@ -729,116 +735,130 @@ void update_power() {
 }
 
 #ifdef WLED_LEDS
+// Advance one per-color state machine: 2-min entry gate, 2-min exit gate with hysteresis.
+// Logs at LOG_INFO on pending start, LOG_NOTICE on activation/deactivation.
+static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_cond,
+                               uint32_t now_ms, const char *name) {
+  if( !st.active ) {
+    st.exit_ms = 0;
+    if( entry_cond ) {
+      if( !st.enter_ms ) {
+        st.enter_ms = now_ms;
+        syslog.logf(LOG_INFO, "WLED %s pending on", name);
+      } else if( now_ms - st.enter_ms >= WLED_PEND_MS ) {
+        st.active   = true;
+        st.enter_ms = 0;
+        syslog.logf(LOG_NOTICE, "WLED %s on", name);
+      }
+    } else {
+      st.enter_ms = 0;
+    }
+  } else {
+    st.enter_ms = 0;
+    if( exit_cond ) {
+      if( !st.exit_ms ) {
+        st.exit_ms = now_ms;
+        syslog.logf(LOG_INFO, "WLED %s pending off", name);
+      } else if( now_ms - st.exit_ms >= WLED_PEND_MS ) {
+        st.active  = false;
+        st.exit_ms = 0;
+        syslog.logf(LOG_NOTICE, "WLED %s off", name);
+      }
+    } else {
+      st.exit_ms = 0;
+    }
+  }
+}
+
 void send_wled() {
   static uint32_t last_send_ms = 0;
   uint32_t now_ms = millis();
 
-  time_t now = time(NULL);
-  bool valid_time = (now > 1000000000UL);
+  time_t now_t = time(NULL);
+  bool valid_time = (now_t > 1000000000UL);
 
-  // Determine the target color from current conditions.
-  // Priority: red (high load) > green (excess production) > blue (selling) > dark violet (error).
-  uint8_t r = 0, g = 0, b = 0;
-
+  // Power readings in W (live_power is in 1/10 W)
+  uint64_t aPlusW = 0, aMinusW = 0;
   if( meter_seen && live_power.uptime != 0 ) {
-    uint64_t aPlusW  = live_power.aPlusW  / 10;  // convert 1/10 W → W
-    uint64_t aMinusW = live_power.aMinusW / 10;
-
-    if( aPlusW > WLED_CONSUMPTION_HIGH ) {
-      r = 0xff;  // medium red: high consumption
-    }
-    else if( aMinusW > WLED_BACKFEED_TOO_HIGH ) {
-      g = 0xff;  // medium green: excess production, can't sell all
-    }
-    else if( aMinusW > WLED_BACKFEED_GOOD ) {
-      b = 0xff;  // medium blue: selling to grid
-    }
-
-    if( r || g || b ) {
-      r = (uint16_t)wled_brightness * r / 255;
-      g = (uint16_t)wled_brightness * g / 255;
-      b = (uint16_t)wled_brightness * b / 255;
-    }
+    aPlusW  = live_power.aPlusW  / 10;
+    aMinusW = live_power.aMinusW / 10;
   }
 
-  // Error state: dark violet during daytime when data or connections are stale.
-  // Requires valid NTP time so the daytime check is meaningful.
-  if( !(r || g || b) && valid_time ) {
+  // Each color: entry condition (above threshold) / exit condition (below threshold - hysteresis).
+  // Using "value + HYST < threshold" avoids unsigned underflow.
+  wled_update_state(wled_red,
+    aPlusW  > WLED_CONSUMPTION_HIGH,
+    aPlusW  + WLED_HYST_W < WLED_CONSUMPTION_HIGH,
+    now_ms, "red");
+  wled_update_state(wled_green,
+    aMinusW > WLED_BACKFEED_TOO_HIGH,
+    aMinusW + WLED_HYST_W < WLED_BACKFEED_TOO_HIGH,
+    now_ms, "green");
+  wled_update_state(wled_blue,
+    aMinusW > WLED_BACKFEED_GOOD,
+    aMinusW + WLED_HYST_W < WLED_BACKFEED_GOOD,
+    now_ms, "blue");
+
+  // Violet: daytime + no valid meter reading for 2 min (same gate as WLED_PEND_MS)
+  bool daytime = false;
+  bool no_meter = (recv_time == 0 || now_t - recv_time > 120);
+  if( valid_time ) {
     struct tm t;
-    localtime_r(&now, &t);
-    bool daytime = (t.tm_hour >= WLED_DAY_START && t.tm_hour < WLED_DAY_END);
-    if( daytime ) {
-      bool no_meter  = (recv_time == 0 || now - recv_time > 300);
-      bool no_db     = (post_time > 0 && now - post_time > 1800);
-      bool no_broker = false;
-#ifdef DTU_TOPIC
-      no_broker = (last_mqtt_ok > 0 && now - last_mqtt_ok > 1800);
-#endif
-      if( no_meter || no_db || no_broker ) {
-        r = 25; g = 0; b = 50;  // dark violet
-      }
-    }
+    localtime_r(&now_t, &t);
+    daytime = (t.tm_hour >= WLED_DAY_START && t.tm_hour < WLED_DAY_END);
   }
+  wled_update_state(wled_violet,
+    daytime && no_meter,
+    !daytime || !no_meter,
+    now_ms, "violet");
 
-  // Stability gate: only apply a color change after it has held for 5 minutes.
-  if( r != wled_cand_r || g != wled_cand_g || b != wled_cand_b ) {
-    if( wled_cand_r != wled_active_r || wled_cand_g != wled_active_g || wled_cand_b != wled_active_b ) {
-      syslog.logf(LOG_INFO, "WLED pending: %s -> %s (reset)",
-        wled_color_name(wled_cand_r, wled_cand_g, wled_cand_b),
-        wled_color_name(r, g, b));
-    } else {
-      syslog.logf(LOG_NOTICE, "WLED pending: %s -> %s (5 min to apply)",
-        wled_color_name(wled_active_r, wled_active_g, wled_active_b),
-        wled_color_name(r, g, b));
+  // Log countdown once per minute while any color is pending
+  if( now_ms - wled_last_log_ms >= 60000 ) {
+    const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+    const char *cn[]           = {"red", "green", "blue", "violet"};
+    char buf[80] = "";
+    size_t bl = 0;
+    for( int i = 0; i < 4; i++ ) {
+      uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
+      if( !pms ) continue;
+      int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+      if( rem <= 0 ) continue;
+      bl += snprintf(buf + bl, sizeof(buf) - bl, "%s%s%s in %d s",
+        bl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
     }
-    wled_cand_r = r; wled_cand_g = g; wled_cand_b = b;
-    wled_cand_since_ms = now_ms;
-  }
-
-  // Log countdown once per minute while a change is pending
-  bool pending = (wled_cand_r != wled_active_r || wled_cand_g != wled_active_g || wled_cand_b != wled_active_b);
-  if( pending && now_ms - wled_last_log_ms >= 60000 ) {
-    uint32_t elapsed = now_ms - wled_cand_since_ms;
-    int32_t  remain  = (int32_t)(WLED_STABLE_MS - elapsed) / 1000;
-    if( remain > 0 ) {
-      syslog.logf(LOG_INFO, "WLED: %s active, %s pending, %d s remaining",
-        wled_color_name(wled_active_r, wled_active_g, wled_active_b),
-        wled_color_name(wled_cand_r, wled_cand_g, wled_cand_b),
-        remain);
-    }
+    if( bl ) syslog.logf(LOG_INFO, "WLED pending: %s active, %s", wled_active_color_name(), buf);
     wled_last_log_ms = now_ms;
   }
 
-  if( now_ms - wled_cand_since_ms >= WLED_STABLE_MS ) {
-    if( wled_cand_r != wled_active_r || wled_cand_g != wled_active_g || wled_cand_b != wled_active_b ) {
-      syslog.logf(LOG_NOTICE, "WLED: promoted %s -> %s",
-        wled_color_name(wled_active_r, wled_active_g, wled_active_b),
-        wled_color_name(wled_cand_r, wled_cand_g, wled_cand_b));
-    }
-    wled_active_r = wled_cand_r; wled_active_g = wled_cand_g; wled_active_b = wled_cand_b;
-    wled_last_log_ms = now_ms;
+  // Priority resolution: green > red > blue > violet
+  uint8_t r = 0, g = 0, b = 0;
+  if(      wled_green.active  ) { g = wled_brightness; }
+  else if( wled_red.active    ) { r = wled_brightness; }
+  else if( wled_blue.active   ) { b = wled_brightness; }
+  else if( wled_violet.active ) { r = 25; b = 50; }
+
+  // Track color changes for the home page
+  if( wled_r != r || wled_g != g || wled_b != b ) {
+    wled_change = now_ms;
+    wled_r = r; wled_g = g; wled_b = b;
   }
 
-  // Rate-limit UDP sends to just under the WLED hold time.
+  // Rate-limit UDP sends to just under the WLED hold time
   if( now_ms - last_send_ms < (uint32_t)(wled_secs - 1) * 1000 ) return;
 
-  if( wled_active_r || wled_active_g || wled_active_b ) {
+  if( r || g || b ) {
     if( wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
       wledUDP.write(2);  // WLED proto DRGB
       wledUDP.write(wled_secs);
       int led = WLED_LEDS;
       while( led-- ) {
-        wledUDP.write(wled_active_r);
-        wledUDP.write(wled_active_g);
-        wledUDP.write(wled_active_b);
+        wledUDP.write(r);
+        wledUDP.write(g);
+        wledUDP.write(b);
       }
       wledUDP.endPacket();
       last_send_ms = now_ms;
       wled_update  = now_ms;
-      if( wled_r != wled_active_r || wled_g != wled_active_g || wled_b != wled_active_b ) {
-        wled_change = now_ms;
-        wled_r = wled_active_r; wled_g = wled_active_g; wled_b = wled_active_b;
-      }
     }
   }
 }
@@ -876,21 +896,13 @@ static const char poll_script[] PROGMEM =
   "s('ap_kwh',d.ap_kwh,4);s('am_kwh',d.am_kwh,4);"
   "['today','yesterday','thisweek','lastweek','thismonth','lastmonth','thisyear','lastyear']"
   ".forEach(p=>{s(p+'_in',d[p+'_in'],4);s(p+'_out',d[p+'_out'],4);});"
-  "if(d.wled_active!==undefined){"
-  "const sw=document.getElementById('wled_swatch');"
-  "const cl=document.getElementById('wled_color');"
+  "if(d.wled_color!==undefined){"
   "const pr=document.getElementById('wled_pending_row');"
   "const pc=document.getElementById('wled_pending_cell');"
-  "if(sw&&cl){"  // update active color swatch if available
-  "}"  // active color is sent via UDP; don't override #RRGGBB here — leave for now
   "if(pr&&pc){"
-  "if(d.wled_pending){"
-  "pr.style.display='';"
-  "pc.textContent=d.wled_pending+(d.wled_pending_secs>0?' in '+d.wled_pending_secs+' s':'');"
-  "}else{"
-  "pr.style.display='none';"
+  "if(d.wled_pending){pr.style.display='';pc.textContent=d.wled_pending;}"
+  "else{pr.style.display='none';}"
   "}}"
-  "}"
   "}catch(e){}finally{setTimeout(r,2000);}}"
   "r();"
   "</script>";
@@ -950,27 +962,32 @@ void send_main_page() {
 #ifdef WLED_LEDS
   {
     uint32_t now_ms = millis();
-    if( (wled_r || wled_g || wled_b) && (now_ms - wled_update) >= (wled_secs * 1000) ) {
-      wled_change += wled_secs * 1000;
-      wled_r = 0; wled_g = 0; wled_b = 0;
-    }
     uint32_t color_int = ((uint32_t)wled_r << 16) | ((uint32_t)wled_g << 8) | wled_b;
-    bool has_pending = (wled_cand_r != wled_active_r || wled_cand_g != wled_active_g || wled_cand_b != wled_active_b);
-    int32_t remain_s = has_pending ? (int32_t)(WLED_STABLE_MS - (now_ms - wled_cand_since_ms)) / 1000 : -1;
+    // Build initial pending string (same logic as /api/stats)
+    char pend[100] = "";
+    size_t pl = 0;
+    const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+    const char *cn[]           = {"red", "green", "blue", "violet"};
+    for( int i = 0; i < 4; i++ ) {
+      uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
+      if( !pms ) continue;
+      int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+      if( rem < 0 ) rem = 0;
+      pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
+        pl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
+    }
     snprintf(web_buf, sizeof(web_buf),
       "<div class=\"card\"><h2>WLED</h2><table>"
       "<tr><th>Host</th><td><code>" WLED_HOST ":%d</code> &middot; %d LEDs</td></tr>"
-      "<tr><th>Color</th><td><span id=\"wled_swatch\" class=\"swatch\" style=\"background:#%06x\"></span>"
-      "<code id=\"wled_color\">#%06x</code></td></tr>"
-      "<tr id=\"wled_pending_row\" style=\"%s\">"
-      "<th>Pending</th><td id=\"wled_pending_cell\">%s%s%s</td></tr>"
+      "<tr><th>Color</th><td><span class=\"swatch\" style=\"background:#%06x\"></span>"
+      "<code>%s</code></td></tr>"
+      "<tr id=\"wled_pending_row\"%s>"
+      "<th>Pending</th><td id=\"wled_pending_cell\">%s</td></tr>"
       "</table></div>",
       WLED_PORT, WLED_LEDS,
-      color_int, color_int,
-      has_pending ? "" : "display:none",
-      has_pending ? wled_color_name(wled_cand_r, wled_cand_g, wled_cand_b) : "",
-      (has_pending && remain_s > 0) ? " in " : "",
-      (has_pending && remain_s > 0) ? (String(remain_s) + " s").c_str() : "");
+      color_int, wled_active_color_name(),
+      pl ? "" : " style=\"display:none\"",
+      pend);
     web_server.sendContent(web_buf);
   }
 #endif
@@ -1014,15 +1031,24 @@ void setup_webserver() {
 #ifdef WLED_LEDS
     {
       uint32_t now_ms = millis();
-      bool has_pending = (wled_cand_r != wled_active_r || wled_cand_g != wled_active_g || wled_cand_b != wled_active_b);
-      int32_t remain_s = has_pending ? (int32_t)(WLED_STABLE_MS - (now_ms - wled_cand_since_ms)) / 1000 : -1;
+      char pend[100] = "";
+      size_t pl = 0;
+      const WledColorState *cs[] = {&wled_red, &wled_green, &wled_blue, &wled_violet};
+      const char *cn[]           = {"red", "green", "blue", "violet"};
+      for( int i = 0; i < 4; i++ ) {
+        uint32_t pms = cs[i]->enter_ms ? cs[i]->enter_ms : cs[i]->exit_ms;
+        if( !pms ) continue;
+        int32_t rem = (int32_t)(WLED_PEND_MS - (now_ms - pms)) / 1000;
+        if( rem < 0 ) rem = 0;
+        pl += snprintf(pend + pl, sizeof(pend) - pl, "%s%s%s in %d s",
+          pl ? ", " : "", cn[i], cs[i]->exit_ms ? " off" : "", rem);
+      }
       pos += snprintf(json + pos, sizeof(json) - pos,
-        ",\"wled_active\":\"%s\",\"wled_pending\":%s%s%s,\"wled_pending_secs\":%s",
-        wled_color_name(wled_active_r, wled_active_g, wled_active_b),
-        has_pending ? "\"" : "null",
-        has_pending ? wled_color_name(wled_cand_r, wled_cand_g, wled_cand_b) : "",
-        has_pending ? "\"" : "",
-        has_pending && remain_s > 0 ? String(remain_s).c_str() : "null");
+        ",\"wled_color\":\"%s\",\"wled_pending\":%s%s%s",
+        wled_active_color_name(),
+        pl ? "\"" : "null",
+        pl ? pend : "",
+        pl ? "\"" : "");
     }
 #endif
     pos += emit_period_json(json + pos, sizeof(json) - pos, "today",     &now_period,      &today_start);
