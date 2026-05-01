@@ -1326,7 +1326,7 @@ void setup_webserver() {
 
     // Green
     snprintf(web_buf, sizeof(web_buf),
-      "<fieldset><legend>Green &mdash; excess production (A&minus; &gt; limit)</legend>"
+      "<fieldset><legend>Excess production (A&minus; &gt; limit)</legend>"
       "<div class=\"frow\">"
       "<span><label>Limit (W)</label><input type=\"number\" name=\"green_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
       "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"green_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
@@ -1338,7 +1338,7 @@ void setup_webserver() {
 
     // Blue
     snprintf(web_buf, sizeof(web_buf),
-      "<fieldset><legend>Blue &mdash; selling to grid (A&minus; &gt; limit)</legend>"
+      "<fieldset><legend>Selling to grid (A&minus; &gt; limit)</legend>"
       "<div class=\"frow\">"
       "<span><label>Limit (W)</label><input type=\"number\" name=\"blue_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
       "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"blue_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
@@ -1350,7 +1350,7 @@ void setup_webserver() {
 
     // Red
     snprintf(web_buf, sizeof(web_buf),
-      "<fieldset><legend>Red &mdash; high demand (A+ &gt; limit)</legend>"
+      "<fieldset><legend>High demand (A+ &gt; limit)</legend>"
       "<div class=\"frow\">"
       "<span><label>Limit (W)</label><input type=\"number\" name=\"red_limit\" value=\"%u\" min=\"0\" max=\"30000\"></span>"
       "<span><label>Hysteresis (W)</label><input type=\"number\" name=\"red_hyst\" value=\"%u\" min=\"0\" max=\"5000\"></span>"
@@ -1362,7 +1362,7 @@ void setup_webserver() {
 
     // Violet
     snprintf(web_buf, sizeof(web_buf),
-      "<fieldset><legend>Violet &mdash; errors (daytime only)</legend>"
+      "<fieldset><legend>Errors (daytime only)</legend>"
       "<div class=\"frow\">"
       "<span><label>Delay (s)</label><input type=\"number\" name=\"violet_delay\" value=\"%u\" min=\"0\" max=\"3600\"></span>"
       "<span><label>Color</label><input type=\"color\" name=\"violet_color\" value=\"%s\"></span>"
