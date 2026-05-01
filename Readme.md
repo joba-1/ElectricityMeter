@@ -16,6 +16,8 @@ dark-themed nav bar:
   week, month and year. On the first valid reading after boot the device queries InfluxDB
   for the meter value at-or-after the start of each period so consumption stays correct
   across reboots; periods with no historical data show a dash.
+* `/wled` – WLED settings: runtime-configurable color thresholds, hysteresis delays, colors,
+  and a toggle for WLED live-receive mode (only shown when `WLED_LEDS` is defined)
 * `/json` – stable JSON API (unchanged across versions)
 * `/sml` – last raw SML record (binary download, unchanged)
 * `/update` – OTA firmware upload
@@ -56,11 +58,16 @@ Every message below is at `LOG_NOTICE` or higher and appears under the device ho
 ### WLED Visual Feedback
 Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).
 
-Color thresholds (configurable in platformio.ini):
-- **Red** - High consumption (> `WLED_CONSUMPTION_HIGH` W, default 4000 W)
-- **Blue** - Too high backfeed (> `WLED_BACKFEED_TOO_HIGH` W, default disabled)
-- **Cyan** - Very high backfeed (> `WLED_BACKFEED_VERY_HIGH` W, default disabled)
-- **Green** - Good backfeed (> `WLED_BACKFEED_GOOD` W, default 200 W)
+Color thresholds and priority (highest wins; all configurable via `/wled` or `platformio.ini`):
+
+| Priority | Color | Condition | Default threshold |
+|----------|-------|-----------|-------------------|
+| 1 (highest) | **Green** | Backfeed too high (> `WLED_BACKFEED_TOO_HIGH` W) | 7000 W |
+| 2 | **Red** | Consumption high (> `WLED_CONSUMPTION_HIGH` W) | 4000 W |
+| 3 | **Blue** | Good backfeed (> `WLED_BACKFEED_GOOD` W) | 500 W |
+| 4 (lowest) | **Violet** | Daytime error (no meter / DB / MQTT for too long) | `WLED_DAY_START`–`WLED_DAY_END` |
+
+All colors use configurable hysteresis delays to avoid rapid flickering.
 
 ### Dynamic OpenDTU Inverter Limit
 Enabled if `DTU_TOPIC` is defined. Automatically adjusts the inverter power limit via MQTT to keep grid backfeed within a target range (`BACKFEED_MIN` to `BACKFEED_MAX`).
@@ -78,14 +85,34 @@ The MQTT topic format is: `DTU_TOPIC/INVERTER_SERIAL/cmd/limit_nonpersistent_abs
 ## Hardware
 
 * Wemos Mini D1 ESP8266
-* IR LED (940nm) as receiver
+* IR LED (940nm) used as photodiode receiver
 * NPN transistor (e.g. BC546)
 
 ```
-GND -- -_LED_+ -- NPN_B
-GND -- E_NPN_C -- R_10k -- V_3.3
-NPN_C -- GPIO_Rx
+        3.3V
+         │
+       [10kΩ]
+         │
+         ├──────────────── GPIO Rx (Serial)
+         │
+         C
+         │
+        ─┤
+   B ───┤   NPN (BC546)
+   │    ─┤
+   │     │
+   │     E
+   │     │
+   ▼     │     IR LED (940nm)
+  ─┴─    │      ▼  = anode (+)
+   │     │     ─┴─ = cathode bar (−)
+   │     │
+   └─────┴── GND
 ```
+
+The IR LED acts as a photodiode: meter IR pulses generate a small photocurrent
+into the NPN base, pulling the collector low against the 10 kΩ pull-up to 3.3V.
+The resulting active-low signal feeds the hardware serial Rx pin.
 
 ## Building and Uploading
 
@@ -116,11 +143,14 @@ All power limits and thresholds are configurable in `platformio.ini` under the `
 prod_kw_max = 15          # Max production/feed-in power (kW)
 usage_kw_max = 20         # Max consumption power (kW)
 
-# WLED visual feedback thresholds (in W)
-wled_consumption_high = 4000     # Red warning
-wled_backfeed_too_high = 99999   # Blue (disabled by default)
-wled_backfeed_very_high = 99999  # Cyan (disabled by default)
-wled_backfeed_good = 200         # Green
+# WLED visual feedback (see /wled page for runtime adjustment)
+wled_leds = 60                   # Number of LEDs
+wled_brightness = 100            # Master brightness (0–255)
+wled_consumption_high = 4000     # Red: high consumption threshold (W)
+wled_backfeed_too_high = 7000    # Green: backfeed too high threshold (W)
+wled_backfeed_good = 500         # Blue: good backfeed threshold (W)
+wled_day_start = 7               # Violet error indicator: start hour (0–23)
+wled_day_end = 21                # Violet error indicator: end hour (0–23)
 
 # Inverter control
 inverter_limit = 800             # Max inverter output (W)
