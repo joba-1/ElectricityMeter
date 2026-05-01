@@ -117,7 +117,7 @@ void post_data() {
 
 #ifdef WLED_LEDS
 WiFiUDP wledUDP;
-const uint8_t wled_secs = 5;
+const uint8_t wled_secs = 10;       // DRGB hold time; refresh at wled_secs/2 for safe overlap
 // Consider enabling wled setting "Force max brightness" to be independent from wled master brightness
 const uint8_t wled_brightness = WLED_BRIGHTNESS;  // 0..255
 // only for display on web page
@@ -154,6 +154,35 @@ static const char *wled_active_color_name() {
   if( wled_blue.active   ) return "blue";
   if( wled_violet.active ) return "violet";
   return "off";
+}
+
+// Live-receive status: -1=unknown, 0=disabled, 1=enabled
+static int8_t wled_live_en = -1;
+
+static int8_t wled_fetch_live_en() {
+  WiFiClient wc;
+  HTTPClient wh;
+  if( !wh.begin(wc, WLED_HOST, 80, "/json/cfg") ) return -1;
+  int st = wh.GET();
+  if( st != 200 ) { wh.end(); return -1; }
+  String body = wh.getString();
+  wh.end();
+  int lp = body.indexOf("\"live\":");
+  if( lp < 0 ) return -1;
+  int ep = body.indexOf("\"en\":", lp);
+  if( ep < 0 || ep - lp > 30 ) return -1;
+  return body.substring(ep + 5, ep + 9) == "true" ? 1 : 0;
+}
+
+static bool wled_post_live_en(bool enable) {
+  WiFiClient wc;
+  HTTPClient wh;
+  if( !wh.begin(wc, WLED_HOST, 80, "/json/cfg") ) return false;
+  wh.addHeader("Content-Type", "application/json");
+  int st = wh.POST(enable ? String("{\"if\":{\"live\":{\"en\":true}}}")
+                           : String("{\"if\":{\"live\":{\"en\":false}}}"));
+  wh.end();
+  return st == 200;
 }
 #endif
 
@@ -908,8 +937,8 @@ void send_wled() {
     wled_r = r; wled_g = g; wled_b = b;
   }
 
-  // Rate-limit UDP sends to just under the WLED hold time
-  if( now_ms - last_send_ms < (uint32_t)(wled_secs - 1) * 1000 ) return;
+  // Refresh at half the hold time so any single missed call never causes a gap
+  if( now_ms - last_send_ms < (uint32_t)(wled_secs / 2) * 1000 ) return;
 
   if( r || g || b ) {
     if( wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
@@ -1264,6 +1293,9 @@ void setup_webserver() {
       web_server.send(303, "text/plain", "");
       return;
     }
+    // Check live-receive status from WLED (blocks briefly but only on page load)
+    wled_live_en = wled_fetch_live_en();
+
     // Build hex color strings for the form
     char c_green[8], c_blue[8], c_red[8], c_violet[8];
     snprintf(c_green,  sizeof(c_green),  "#%02x%02x%02x", cfg_green.r,  cfg_green.g,  cfg_green.b);
@@ -1273,6 +1305,22 @@ void setup_webserver() {
 
     send_html_head(200, NULL);
     send_nav("wled");
+
+    // Live-receive status card
+    snprintf(web_buf, sizeof(web_buf),
+      "<div class=\"card\"><h2>WLED Live Receive</h2>"
+      "<div class=\"frow\">"
+      "<span>Status: <strong>%s</strong></span>"
+      "<form method=\"post\" action=\"/wled/live\">"
+      "<input type=\"hidden\" name=\"en\" value=\"%d\">"
+      "<input type=\"submit\" value=\"%s\"%s></form>"
+      "</div></div>",
+      wled_live_en == 1 ? "enabled" : wled_live_en == 0 ? "disabled" : "unknown",
+      wled_live_en == 1 ? 0 : 1,
+      wled_live_en == 1 ? "Disable" : "Enable",
+      wled_live_en < 0 ? " disabled" : "");
+    web_server.sendContent(web_buf);
+
     web_server.sendContent_P(PSTR("<div class=\"card\"><h2>WLED Settings</h2>"
       "<form method=\"post\" action=\"/wled\">"));
 
@@ -1326,6 +1374,21 @@ void setup_webserver() {
       "<div class=\"frow\"><input type=\"submit\" value=\"Apply\"></div>"
       "</form></div>"));
     send_html_foot();
+  });
+
+  web_server.on("/wled/live", HTTP_POST, []() {
+    if( web_server.hasArg("en") ) {
+      bool en = web_server.arg("en") == "1";
+      bool ok = wled_post_live_en(en);
+      if( ok ) {
+        wled_live_en = en ? 1 : 0;
+        syslog.logf(LOG_NOTICE, "WLED live receive %s", en ? "enabled" : "disabled");
+      } else {
+        syslog.logf(LOG_WARNING, "WLED live receive change failed");
+      }
+    }
+    web_server.sendHeader("Location", "/wled");
+    web_server.send(303, "text/plain", "");
   });
 #endif
 
