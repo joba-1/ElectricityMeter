@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
+  <rect width="180" height="180" rx="32" fill="#0b3d2e"/>
+  <rect x="22" y="34" width="136" height="112" rx="10" fill="#0e5a44" stroke="#7be0b3" stroke-width="3"/>
+  <rect x="34" y="48" width="112" height="36" rx="4" fill="#031b13"/>
+  <text x="90" y="76" text-anchor="middle" font-family="'Courier New',monospace" font-weight="700" font-size="26" fill="#7be0b3">12345.6</text>
+  <text x="138" y="76" text-anchor="end" font-size="9" fill="#7be0b3">kWh</text>
+  <path d="M82 96 L70 124 L88 124 L78 146 L110 116 L92 116 L102 96 Z" fill="#ffd23a" stroke="#0b3d2e" stroke-width="2" stroke-linejoin="round"/>
+</svg>

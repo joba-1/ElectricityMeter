@@ -2,6 +2,7 @@
 
 // defaults, can be overridden by platformio.ini build_flags
 #include "build_config.h"
+#include "web_icons.h"
 
 // Web Updater
 #include <ESP8266HTTPUpdateServer.h>
@@ -643,7 +644,8 @@ void send_html_head( int status, const char *meta_refresh ) {
     "<!doctype html><html lang=\"en\"><head>"
     "<title>" PROGNAME " " HOSTNAME " v" VERSION "</title>"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<meta charset=\"utf-8\">"));
+    "<meta charset=\"utf-8\">"
+    ICON_LINKS_HTML));
   if( meta_refresh && *meta_refresh ) {
     web_server.sendContent(meta_refresh);
   }
