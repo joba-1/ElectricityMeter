@@ -568,9 +568,11 @@ static const char css_block[] PROGMEM =
   "tr:last-child td{border-bottom:none}"
   // Consumption table: band each Last/Prev pair (4n+1,4n+2 = every other pair)
   // so the four time-scale groups stand out; heavier divider between pairs.
-  ".periods tbody tr:nth-child(4n+1) td,.periods tbody tr:nth-child(4n+2) td"
+  ".periods tbody tr:nth-child(4n+1) th,.periods tbody tr:nth-child(4n+1) td,"
+  ".periods tbody tr:nth-child(4n+2) th,.periods tbody tr:nth-child(4n+2) td"
     "{background:#1b2230}"
-  ".periods tbody tr:nth-child(2n) td{border-bottom-color:#30363d}"
+  ".periods tbody tr:nth-child(2n) th,.periods tbody tr:nth-child(2n) td"
+    "{border-bottom-color:#30363d}"
   ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem}"
   ".stat{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.75rem}"
   ".stat .label{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}"
