@@ -566,6 +566,11 @@ static const char css_block[] PROGMEM =
   "th{color:#8b949e;font-weight:600;font-size:.78rem}"
   "thead th{text-transform:uppercase;letter-spacing:.04em}"
   "tr:last-child td{border-bottom:none}"
+  // Consumption table: band each Last/Prev pair (4n+1,4n+2 = every other pair)
+  // so the four time-scale groups stand out; heavier divider between pairs.
+  ".periods tbody tr:nth-child(4n+1) td,.periods tbody tr:nth-child(4n+2) td"
+    "{background:#1b2230}"
+  ".periods tbody tr:nth-child(2n) td{border-bottom-color:#30363d}"
   ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem}"
   ".stat{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.75rem}"
   ".stat .label{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}"
@@ -1194,7 +1199,7 @@ void setup_webserver() {
     }
     web_server.sendContent_P(PSTR(
       "<div class=\"card\"><h2><span class=\"cap\">Consumption</span> (kWh)</h2>"
-      "<table><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
+      "<table class=\"periods\"><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
     emit_period_row("Last 24h",  "last24h",  &now_period,         &rolling_edge[E_H24]);
     emit_period_row("Prev 24h",  "prev24h",  &rolling_edge[E_H24],  &rolling_edge[E_H48]);
     emit_period_row("Last 7d",   "last7d",   &now_period,         &rolling_edge[E_D7]);
