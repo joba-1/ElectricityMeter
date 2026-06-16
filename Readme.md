@@ -4,7 +4,7 @@
 * Validate meter readings against configured power limits to reject bogus data
 * Optionally send power status (feeding to grid or high load) to WLED with UDP
 * Optionally set limit of an OpenDTU inverter via MQTT to avoid high feed to grid
-* Modern web UI with live power and per-period consumption (today, yesterday, this/last week, month, year)
+* Modern web UI with live power and rolling-window consumption (last/prev 24h, 7d, 30d, 365d)
 
 ## Web UI
 
@@ -12,10 +12,13 @@ The device serves a small set of pages; every page links to the others with a co
 dark-themed nav bar:
 
 * `/` – Home: live power, meter status, optional inverter and WLED cards
-* `/monitor` – auto-refreshing live power plus consumption for today, yesterday, this/last
-  week, month and year. On the first valid reading after boot the device queries InfluxDB
-  for the meter value at-or-after the start of each period so consumption stays correct
-  across reboots; periods with no historical data show a dash.
+* `/monitor` – auto-refreshing live power plus consumption over **rolling windows ending
+  now**: last 24h vs the 24h before it, last 7d vs the 7d before, last 30d vs prior 30d,
+  last 365d vs prior 365d. Because each "last" and "prev" pair has identical length, the
+  comparison is fair at any moment (unlike calendar periods, where a mid-day "today" only
+  covered part of the day). The window edges are fetched from InfluxDB in a single batched
+  multi-statement query (refreshed ~once a minute, matching the meter's sample rate); a
+  window whose edge can't be read yet shows a dash.
 * `/wled` – WLED settings: runtime-configurable color thresholds, hysteresis delays, colors,
   and a toggle for WLED live-receive mode (only shown when `WLED_LEDS` is defined)
 * `/json` – stable JSON API (unchanged across versions)

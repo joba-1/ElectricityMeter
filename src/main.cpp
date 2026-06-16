@@ -390,89 +390,95 @@ void handle_mqtt() {
 }
 #endif
 
-// Period consumption tracking. Baselines hold the meter reading at the start
-// of each calendar period; rotating them on rollover lets us derive
-// current-period and previous-period consumption from delta math.
+// Rolling-window consumption tracking.
+//
+// Instead of calendar-aligned baselines (which made "today" cover only the
+// hours since local midnight, an unfair comparison against a full-day
+// "yesterday"), every period is now a *rolling window of fixed length ending
+// at now*. Consumption over a window is the meter-reading delta between its two
+// edges, and the "previous" period is the equally long window immediately
+// before it. Because both windows have identical length, the comparison is
+// fair at any moment.
+//
+// We hold one meter reading ("edge") per window boundary. With the live reading
+// as edges[0]=now, the 8 historical edges below give all four current/previous
+// pairs:
+//   last 24h  = edges[NOW]-edges[E_H24]   prev 24h  = edges[E_H24]-edges[E_H48]
+//   last 7d   = edges[NOW]-edges[E_D7]    prev 7d   = edges[E_D7] -edges[E_D14]
+//   last 30d  = edges[NOW]-edges[E_D30]   prev 30d  = edges[E_D30]-edges[E_D60]
+//   last 365d = edges[NOW]-edges[E_D365]  prev 365d = edges[E_D365]-edges[E_D730]
+// The 8 historical edges move continuously, so they are not derivable from
+// local rollover events — they are (re)fetched from InfluxDB in one batched
+// query. edges[NOW] is taken live from the meter at display time.
 typedef struct {
   uint64_t aPlus;   // 1/10 Wh
   uint64_t aMinus;  // 1/10 Wh
   bool valid;
 } period_t;
 
-static period_t today_start      = {0, 0, false};
-static period_t yesterday_start  = {0, 0, false};
-static period_t thisweek_start   = {0, 0, false};
-static period_t lastweek_start   = {0, 0, false};
-static period_t thismonth_start  = {0, 0, false};
-static period_t lastmonth_start  = {0, 0, false};
-static period_t thisyear_start   = {0, 0, false};
-static period_t lastyear_start   = {0, 0, false};
+// Historical window edges, in the same order as the InfluxDB batch query below.
+enum { E_H24 = 0, E_H48, E_D7, E_D14, E_D30, E_D60, E_D365, E_D730, EDGE_COUNT };
 
-static int last_day_idx   = -1;
-static int last_week_idx  = -1;
-static int last_month_idx = -1;
-static int last_year_idx  = -1;
+// InfluxDB-relative offsets for each historical edge (used to build the query).
+static const char *const edge_offset[EDGE_COUNT] =
+  { "24h", "48h", "7d", "14d", "30d", "60d", "365d", "730d" };
 
-// UTC epoch for the start of the local "today minus N days"
-static time_t local_day_start( time_t now, int days_back ) {
-  struct tm t;
-  localtime_r(&now, &t);
-  t.tm_sec = 0;
-  t.tm_min = 0;
-  t.tm_hour = 0;
-  t.tm_mday -= days_back;
-  t.tm_isdst = -1;
-  return mktime(&t);
+static period_t rolling_edge[EDGE_COUNT];  // all default-zeroed/invalid
+static uint32_t edges_last_ms   = 0;       // millis() of last successful fetch
+static bool     edges_ready     = false;   // at least one fetch has populated edges
+
+// Re-fetch interval. The meter samples ~once/65 s, so polling faster gains
+// nothing; once a minute keeps the rolling edges fresh at negligible cost.
+static const uint32_t edges_refresh_ms = 60 * 1000;
+
+// Parse one InfluxDB CSV result block (from a multi-statement response) into an
+// edge. 'p' points at the start of the block's header line; returns the pointer
+// advanced past the consumed data line, or the next block. A block looks like:
+//   name,tags,time,first,first_1\n
+//   energy,,<time>,<watt>,<watt_out>\n
+// Stored values are integer Wh (from post_data) so we scale back to 1/10 Wh.
+static const char *parse_edge_block( const char *p, period_t *out ) {
+  // Skip the header line.
+  const char *nl = strchr(p, '\n');
+  if( !nl ) return p + strlen(p);
+  const char *line = nl + 1;
+  // Skip 3 commas to reach the 'first' (watt) column: energy,,time,first,first_1
+  int comma = 0;
+  const char *c = line;
+  while( *c && *c != '\n' && comma < 3 ) {
+    if( *c == ',' ) comma++;
+    c++;
+  }
+  if( comma == 3 ) {
+    char *end;
+    unsigned long long ap = strtoull(c, &end, 10);
+    if( end > c && *end == ',' ) {
+      unsigned long long am = strtoull(end + 1, &end, 10);
+      out->aPlus  = (uint64_t)ap * 10;
+      out->aMinus = (uint64_t)am * 10;
+      out->valid  = true;
+    }
+  }
+  // Advance to the start of the next block (line after this data line).
+  const char *nl2 = strchr(line, '\n');
+  return nl2 ? nl2 + 1 : line + strlen(line);
 }
 
-// UTC epoch for the start of the local Monday of "this week minus N weeks"
-static time_t local_week_start( time_t now, int weeks_back ) {
-  struct tm t;
-  localtime_r(&now, &t);
-  t.tm_sec = 0;
-  t.tm_min = 0;
-  t.tm_hour = 0;
-  int wday_mon = (t.tm_wday + 6) % 7;  // Mon=0..Sun=6
-  t.tm_mday -= wday_mon + weeks_back * 7;
-  t.tm_isdst = -1;
-  return mktime(&t);
-}
-
-static time_t local_month_start( time_t now, int months_back ) {
-  struct tm t;
-  localtime_r(&now, &t);
-  t.tm_sec = 0;
-  t.tm_min = 0;
-  t.tm_hour = 0;
-  t.tm_mday = 1;
-  t.tm_mon -= months_back;
-  t.tm_isdst = -1;
-  return mktime(&t);
-}
-
-static time_t local_year_start( time_t now, int years_back ) {
-  struct tm t;
-  localtime_r(&now, &t);
-  t.tm_sec = 0;
-  t.tm_min = 0;
-  t.tm_hour = 0;
-  t.tm_mday = 1;
-  t.tm_mon = 0;
-  t.tm_year -= years_back;
-  t.tm_isdst = -1;
-  return mktime(&t);
-}
-
-// Query InfluxDB for the first 'watt' / 'watt_out' values at-or-after epoch.
-// On success, fills out and returns true. The stored values are integer Wh
-// (from post_data) so we scale back to 1/10 Wh to match itron.aPlus units.
-static bool query_baseline( time_t epoch, period_t *out ) {
-  static char url[256];
-  // Manual URL encoding: ',' -> %2C, '>=' -> %3E%3D, spaces -> '+'
-  snprintf(url, sizeof(url),
-    "/query?db=" INFLUX_DB "&epoch=s"
-    "&q=SELECT+first(watt)%%2Cfirst(watt_out)+FROM+energy+WHERE+time+%%3E%%3D+%lus",
-    (unsigned long)epoch);
+// Fetch all 8 historical window edges from InfluxDB in a single batched,
+// multi-statement query. Using InfluxDB's server-side now() means all windows
+// share one consistent reference instant and we need no accurate local clock.
+// CSV response for 8 windows is ~525 B; we read into a fixed buffer to avoid
+// String churn.
+static bool refresh_rolling_edges() {
+  // Build the multi-statement query: one "SELECT first(...) WHERE time>=now()-<off>"
+  // per edge, separated by ';'. URL-encode ','->%2C ';'->%3B '>='->%3E%3D ' '->'+'.
+  static char url[768];
+  size_t pos = snprintf(url, sizeof(url), "/query?db=" INFLUX_DB "&epoch=s&q=");
+  for( int i = 0; i < EDGE_COUNT; i++ ) {
+    pos += snprintf(url + pos, sizeof(url) - pos,
+      "%sSELECT+first(watt)%%2Cfirst(watt_out)+FROM+energy+WHERE+time+%%3E%%3D+now()-%s",
+      i ? "%3B" : "", edge_offset[i]);
+  }
 
   http.begin(client, INFLUX_SERVER, INFLUX_PORT, url);
   http.setUserAgent(PROGNAME);
@@ -482,92 +488,47 @@ static bool query_baseline( time_t epoch, period_t *out ) {
   bool ok = false;
   if( code == 200 ) {
     String body = http.getString();
-    int nl = body.indexOf('\n');
-    if( nl > 0 && (size_t)(nl + 1) < body.length() ) {
-      // CSV columns: name,tags,time,first,first_1 — skip 3 commas to reach 'first'
-      const char *line = body.c_str() + nl + 1;
-      int comma = 0;
-      while( *line && comma < 3 ) {
-        if( *line == ',' ) comma++;
-        line++;
-      }
-      if( comma == 3 ) {
-        char *end;
-        unsigned long long ap = strtoull(line, &end, 10);
-        if( end > line && *end == ',' ) {
-          unsigned long long am = strtoull(end + 1, &end, 10);
-          out->aPlus  = (uint64_t)ap * 10;
-          out->aMinus = (uint64_t)am * 10;
-          out->valid  = true;
-          ok = true;
-        }
-      }
+    // CSV blocks appear in statement order, separated by a blank line. Walk them
+    // in order and assign to rolling_edge[0..7]. A missing window yields an empty
+    // block (just a blank line) which parse_edge_block leaves invalid.
+    period_t fetched[EDGE_COUNT] = {};
+    const char *p = body.c_str();
+    int got = 0;
+    for( int i = 0; i < EDGE_COUNT && *p; i++ ) {
+      // Skip leading blank lines between blocks.
+      while( *p == '\n' || *p == '\r' ) p++;
+      if( !*p ) break;
+      p = parse_edge_block(p, &fetched[i]);
+      if( fetched[i].valid ) got++;
     }
+    if( got > 0 ) {
+      memcpy(rolling_edge, fetched, sizeof(rolling_edge));
+      edges_ready = true;
+      ok = true;
+    }
+    syslog.logf(LOG_NOTICE, "Rolling edges refreshed: %d/%d windows", got, EDGE_COUNT);
   }
   http.end();
   if( !ok ) {
-    syslog.logf(LOG_NOTICE, "Influx baseline query for epoch %lu http=%d (no data?)",
-                (unsigned long)epoch, code);
+    syslog.logf(LOG_NOTICE, "Influx rolling-edge query http=%d (no data?)", code);
   }
   return ok;
 }
 
-static void load_baselines_from_influx( time_t now ) {
-  syslog.log(LOG_NOTICE, "Loading period baselines from InfluxDB");
-  query_baseline(local_day_start(now, 0),    &today_start);
-  query_baseline(local_day_start(now, 1),    &yesterday_start);
-  query_baseline(local_week_start(now, 0),   &thisweek_start);
-  query_baseline(local_week_start(now, 1),   &lastweek_start);
-  query_baseline(local_month_start(now, 0),  &thismonth_start);
-  query_baseline(local_month_start(now, 1),  &lastmonth_start);
-  query_baseline(local_year_start(now, 0),   &thisyear_start);
-  query_baseline(local_year_start(now, 1),   &lastyear_start);
-  syslog.logf(LOG_NOTICE,
-    "Baselines loaded: today=%d yest=%d thisweek=%d lastweek=%d "
-    "thismonth=%d lastmonth=%d thisyear=%d lastyear=%d",
-    today_start.valid, yesterday_start.valid,
-    thisweek_start.valid, lastweek_start.valid,
-    thismonth_start.valid, lastmonth_start.valid,
-    thisyear_start.valid, lastyear_start.valid);
-}
-
+// Refresh the rolling edges on a timer (and once as soon as the meter is seen).
 void update_period_baselines() {
   if( itron.valid != 0x3f ) return;
-  time_t now = time(NULL);
-  if( now < 1000000000 ) return;  // wait for NTP sync (seconds since epoch ~2001)
-
-  struct tm tm_now;
-  localtime_r(&now, &tm_now);
-
-  int day_idx   = tm_now.tm_year * 400 + tm_now.tm_yday;  // unique per local day
-  int wday_mon  = (tm_now.tm_wday + 6) % 7;               // Mon=0..Sun=6
-  int week_idx  = day_idx - wday_mon;                     // unique per ISO-style week
-  int month_idx = tm_now.tm_year * 12 + tm_now.tm_mon;
-  int year_idx  = tm_now.tm_year;
-
-  period_t curr = { itron.aPlus, itron.aMinus, true };
-
-  if( last_day_idx == -1 ) {
-    // First valid reading after boot+NTP: try to recover historical baselines
-    // from InfluxDB so reboots don't reset our period counters.
-    load_baselines_from_influx(now);
-    // Fall back to current reading for any period without InfluxDB data.
-    if( !today_start.valid     ) today_start     = curr;
-    if( !thisweek_start.valid  ) thisweek_start  = curr;
-    if( !thismonth_start.valid ) thismonth_start = curr;
-    if( !thisyear_start.valid  ) thisyear_start  = curr;
+  uint32_t now_ms = millis();
+  if( !edges_ready || (uint32_t)(now_ms - edges_last_ms) >= edges_refresh_ms ) {
+    if( refresh_rolling_edges() ) {
+      edges_last_ms = now_ms;
+    } else if( !edges_ready ) {
+      // Back off only modestly on early failures so we keep retrying after boot.
+      edges_last_ms = now_ms - edges_refresh_ms + 5000;
+    } else {
+      edges_last_ms = now_ms;  // keep cadence; stale edges remain displayed
+    }
   }
-  else {
-    if( day_idx   != last_day_idx   ) { yesterday_start = today_start;     today_start     = curr; }
-    if( week_idx  != last_week_idx  ) { lastweek_start  = thisweek_start;  thisweek_start  = curr; }
-    if( month_idx != last_month_idx ) { lastmonth_start = thismonth_start; thismonth_start = curr; }
-    if( year_idx  != last_year_idx  ) { lastyear_start  = thisyear_start;  thisyear_start  = curr; }
-  }
-
-  last_day_idx   = day_idx;
-  last_week_idx  = week_idx;
-  last_month_idx = month_idx;
-  last_year_idx  = year_idx;
 }
 
 void format_kwh( char *buf, size_t bufsize, uint64_t one_tenth_wh ) {
@@ -993,7 +954,7 @@ static const char poll_script[] PROGMEM =
   "if(e)e.textContent=(v==null)?'\\u2014':v.toFixed(n);};"
   "s('ap_w',d.ap_w,1);s('am_w',d.am_w,1);"
   "s('ap_kwh',d.ap_kwh,4);s('am_kwh',d.am_kwh,4);"
-  "['today','yesterday','thisweek','lastweek','thismonth','lastmonth','thisyear','lastyear']"
+  "['last24h','prev24h','last7d','prev7d','last30d','prev30d','last365d','prev365d']"
   ".forEach(p=>{s(p+'_in',d[p+'_in'],4);s(p+'_out',d[p+'_out'],4);});"
   "if(d.wled_color!==undefined){"
   "const pr=document.getElementById('wled_pending_row');"
@@ -1156,14 +1117,16 @@ void setup_webserver() {
         pl ? "\"" : "");
     }
 #endif
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "today",     &now_period,      &today_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "yesterday", &today_start,     &yesterday_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "thisweek",  &now_period,      &thisweek_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastweek",  &thisweek_start,  &lastweek_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "thismonth", &now_period,      &thismonth_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastmonth", &thismonth_start, &lastmonth_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "thisyear",  &now_period,      &thisyear_start);
-    pos += emit_period_json(json + pos, sizeof(json) - pos, "lastyear",  &thisyear_start,  &lastyear_start);
+    // Rolling windows: each "last" period spans now back to its edge; each
+    // "prev" period spans the equally long window immediately before it.
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "last24h",  &now_period,             &rolling_edge[E_H24]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "prev24h",  &rolling_edge[E_H24],      &rolling_edge[E_H48]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "last7d",   &now_period,             &rolling_edge[E_D7]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "prev7d",   &rolling_edge[E_D7],       &rolling_edge[E_D14]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "last30d",  &now_period,             &rolling_edge[E_D30]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "prev30d",  &rolling_edge[E_D30],      &rolling_edge[E_D60]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "last365d", &now_period,             &rolling_edge[E_D365]);
+    pos += emit_period_json(json + pos, sizeof(json) - pos, "prev365d", &rolling_edge[E_D365],     &rolling_edge[E_D730]);
     snprintf(json + pos, sizeof(json) - pos, "}");
     web_server.send(200, "application/json", json);
   });
@@ -1225,22 +1188,21 @@ void setup_webserver() {
     send_power_card();
 
     period_t now_period = { latest_aPlus, latest_aMinus, meter_seen };
-    bool all_known = meter_seen
-      && today_start.valid && yesterday_start.valid
-      && thisweek_start.valid && lastweek_start.valid
-      && thismonth_start.valid && lastmonth_start.valid
-      && thisyear_start.valid && lastyear_start.valid;
+    bool all_known = meter_seen && edges_ready;
+    for( int i = 0; all_known && i < EDGE_COUNT; i++ ) {
+      all_known = rolling_edge[i].valid;
+    }
     web_server.sendContent_P(PSTR(
       "<div class=\"card\"><h2><span class=\"cap\">Consumption</span> (kWh)</h2>"
       "<table><thead><tr><th>Period</th><th>Used (A+)</th><th>Fed (A-)</th></tr></thead><tbody>"));
-    emit_period_row("Today",      "today",     &now_period,      &today_start);
-    emit_period_row("Yesterday",  "yesterday", &today_start,     &yesterday_start);
-    emit_period_row("This week",  "thisweek",  &now_period,      &thisweek_start);
-    emit_period_row("Last week",  "lastweek",  &thisweek_start,  &lastweek_start);
-    emit_period_row("This month", "thismonth", &now_period,      &thismonth_start);
-    emit_period_row("Last month", "lastmonth", &thismonth_start, &lastmonth_start);
-    emit_period_row("This year",  "thisyear",  &now_period,      &thisyear_start);
-    emit_period_row("Last year",  "lastyear",  &thisyear_start,  &lastyear_start);
+    emit_period_row("Last 24h",  "last24h",  &now_period,         &rolling_edge[E_H24]);
+    emit_period_row("Prev 24h",  "prev24h",  &rolling_edge[E_H24],  &rolling_edge[E_H48]);
+    emit_period_row("Last 7d",   "last7d",   &now_period,         &rolling_edge[E_D7]);
+    emit_period_row("Prev 7d",   "prev7d",   &rolling_edge[E_D7],   &rolling_edge[E_D14]);
+    emit_period_row("Last 30d",  "last30d",  &now_period,         &rolling_edge[E_D30]);
+    emit_period_row("Prev 30d",  "prev30d",  &rolling_edge[E_D30],  &rolling_edge[E_D60]);
+    emit_period_row("Last 365d", "last365d", &now_period,         &rolling_edge[E_D365]);
+    emit_period_row("Prev 365d", "prev365d", &rolling_edge[E_D365], &rolling_edge[E_D730]);
     if( all_known ) {
       web_server.sendContent_P(PSTR("</tbody></table></div>"));
     }
@@ -1248,7 +1210,7 @@ void setup_webserver() {
       web_server.sendContent_P(PSTR(
         "</tbody></table>"
         "<p class=\"muted\" style=\"font-size:.8rem\">"
-        "A dash (&mdash;) means no baseline value is available yet for that period."
+        "A dash (&mdash;) means the window edge could not be read from InfluxDB yet."
         "</p></div>"));
     }
 
