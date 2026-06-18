@@ -1647,14 +1647,22 @@ static bool is_sane_itron(const itron_3hz_t *it, uint32_t last_uptime) {
 
 bool is_power_valid( uint64_t current_reading_1_10Wh, uint64_t previous_reading_1_10Wh, uint32_t delta_time_s, bool is_aplus ) {
   if( delta_time_s == 0 ) return true;  // skip validation on first reading
-  
-  // Calculate power in W from energy delta over time
-  // (reading1 - reading0) * (1/10 Wh) / time_h * 3600 = power_W
-  // = (reading1 - reading0) * 360 / time_s
-  uint64_t power_W = (current_reading_1_10Wh - previous_reading_1_10Wh) * 360 / delta_time_s;
-  
+
+  // Calculate power in W from energy delta over time:
+  //   (delta in 1/10 Wh) * 360 / time_s = power_W
+  // Defence in depth: B3 (is_sane_itron) already caps both inputs below
+  // MAX_RAW_1_10WH = 1e12, so delta * 360 stays well within uint64 today.
+  // Keep this guard anyway in case the B3 cap is ever relaxed — without it,
+  // a delta above UINT64_MAX/360 (~5e16) wraps and *passes* the limit check,
+  // which is the bug that produced the 139 huge-counter points cleaned up
+  // from InfluxDB.
+  uint64_t delta = current_reading_1_10Wh - previous_reading_1_10Wh;
+  if( delta > UINT64_MAX / 360 ) return false;
+
+  uint64_t power_W = delta * 360 / delta_time_s;
+
   uint32_t max_power_W = is_aplus ? USAGE_KW_MAX * 1000 : PROD_KW_MAX * 1000;
-  
+
   return power_W <= max_power_W;
 }
 
