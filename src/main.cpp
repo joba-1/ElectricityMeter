@@ -59,6 +59,50 @@ static char start_time[30] = "";
 WiFiUDP logUDP;
 Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
 
+// ---- Boot diagnostics ----
+// RTC user memory survives ESP.restart() and exception/WDT crashes; it is
+// only cleared on a real power-off. We stash a reason code before any
+// programmatic restart so the next boot can tell that case apart from a
+// crash/brownout where no reason was set in time.
+enum restart_reason_t : uint8_t {
+  RR_NONE         = 0,  // no reason recorded → crash, WDT, or brownout
+  RR_USER_WEB     = 1,  // POST /reset
+  RR_WIFIMGR_FAIL = 2,  // WiFiManager autoConnect failed
+};
+struct rtc_boot_info_t {
+  uint32_t magic;        // BOOT_MAGIC when initialised
+  uint32_t boot_count;
+  uint8_t  restart_reason;
+  uint8_t  pad[3];
+};
+static const uint32_t BOOT_MAGIC = 0xB007C0DEu;
+static rtc_boot_info_t boot_info;
+
+static void boot_info_load() {
+  ESP.rtcUserMemoryRead(0, (uint32_t*)&boot_info, sizeof(boot_info));
+}
+static void boot_info_save() {
+  ESP.rtcUserMemoryWrite(0, (uint32_t*)&boot_info, sizeof(boot_info));
+}
+// Call right before ESP.restart() so the next boot sees this code.
+static void record_restart_reason(restart_reason_t r) {
+  boot_info_load();
+  if (boot_info.magic != BOOT_MAGIC) {
+    boot_info.magic = BOOT_MAGIC;
+    boot_info.boot_count = 0;
+  }
+  boot_info.restart_reason = (uint8_t)r;
+  boot_info_save();
+}
+static const char *restart_reason_name(uint8_t r) {
+  switch (r) {
+    case RR_NONE:         return "none(crash/brownout)";
+    case RR_USER_WEB:     return "user/reset";
+    case RR_WIFIMGR_FAIL: return "WiFiMgr-fail";
+    default:              return "unknown";
+  }
+}
+
 uint32_t last_counter_reset = 0;      // millis() of last counter reset
 volatile uint32_t counter_events = 0; // events of current interval so far
 
@@ -77,12 +121,23 @@ itron_3hz_t itron = {0};
 time_t recv_time = 0;
 bool recv_detailed = true;
 
-uint8_t sml_raw[2560];  // last sml record, enough for 2s at 9600 baud
+// Reset every Stats interval. CRC counters reported but not yet used to reject.
+static uint32_t sml_crc_ok = 0, sml_crc_bad = 0, sml_overflow = 0;
+
+// Itron SML records are typically 200-500 B. 1 KB covers ~1 s at 9600 baud,
+// twice the largest real frame seen. The state machine in read_serial_sml()
+// drops oversized frames instead of overflowing.
+uint8_t sml_raw[1024];  // last sml record (for /sml endpoint)
 size_t sml_len = 0;  // length of last sml record
 
 char *to_hex( char *buf, size_t len, char sep ) {
-  static char hex[1024*3+1];
+  static char hex[512*3+1];
+  // Hard cap so callers can't overflow even if they pass a longer length.
+  // 512 B input → 1536 chars + NUL, fits the buffer exactly.
+  const size_t max_in = (sizeof(hex) - 1) / 3;
+  if( len > max_in ) len = max_in;
   char *out = hex;
+  if( len == 0 ) { *out = '\0'; return hex; }
   while( len-- ) {
     snprintf(out, 4, "%02x%c", *(buf++), sep);
     out += 3;
@@ -103,14 +158,17 @@ void post_data() {
   http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
   http.setUserAgent(PROGNAME);
   influx_status = http.POST(msg);
-  String payload = http.getString();
-  http.end();
-  
+
   if (influx_status < 200 || influx_status > 299) {
+    // Read body only on error to avoid a per-minute heap alloc/free in the
+    // common case. http.end() right after to release the connection promptly.
+    String payload = http.getString();
+    http.end();
     breathe_interval = err_interval;
     syslog.logf(LOG_ERR, "Post %s:%d%s status=%d msg='%s' response='%s'", INFLUX_SERVER,
                 INFLUX_PORT, uri, influx_status, msg, payload.c_str());
   } else {
+    http.end();
     breathe_interval = ok_interval;
     post_time = time(NULL);
   };
@@ -1185,6 +1243,7 @@ void setup_webserver() {
       "</div>"));
     send_html_foot();
     delay(200);
+    record_restart_reason(RR_USER_WEB);
     ESP.restart();
   });
 
@@ -1416,6 +1475,7 @@ void setup() {
       digitalWrite(DB_LED_PIN, DB_LED_OFF);
       delay(100);
     }
+    record_restart_reason(RR_WIFIMGR_FAIL);
     ESP.restart();
     while (true)
       ;
@@ -1427,6 +1487,48 @@ void setup() {
            WiFi.localIP().toString().c_str());
   Serial.printf(msg);
   syslog.logf(LOG_NOTICE, msg);
+
+  // Boot post-mortem: report ESP reset reason, our recorded restart reason (if
+  // any), and heap. Sent only after WiFi is up so syslog UDP actually delivers.
+  // After read we clear the reason so the *next* boot will only see RR_NONE
+  // unless a record_restart_reason() call set it again — that's how we
+  // distinguish a clean restart from a crash.
+  {
+    boot_info_load();
+    bool rtc_valid = (boot_info.magic == BOOT_MAGIC);
+    uint8_t prev_reason = rtc_valid ? boot_info.restart_reason : RR_NONE;
+    if (!rtc_valid) {
+      boot_info.magic = BOOT_MAGIC;
+      boot_info.boot_count = 0;
+    }
+    boot_info.boot_count++;
+    boot_info.restart_reason = RR_NONE;
+    boot_info_save();
+
+    rst_info *info = ESP.getResetInfoPtr();
+    uint32_t free_heap = ESP.getFreeHeap();
+    uint16_t max_block = ESP.getMaxFreeBlockSize();
+    uint8_t  frag_pct  = ESP.getHeapFragmentation();
+    int      rssi      = WiFi.RSSI();
+
+    if (info && info->reason == REASON_EXCEPTION_RST) {
+      syslog.logf(LOG_ERR,
+        "Boot #%u: reset=%s prev=%s exccause=%u epc1=0x%08x epc2=0x%08x "
+        "epc3=0x%08x excvaddr=0x%08x depc=0x%08x heap=%u maxblk=%u frag=%u%% "
+        "rssi=%d rtc=%d",
+        boot_info.boot_count, ESP.getResetReason().c_str(),
+        restart_reason_name(prev_reason),
+        info->exccause, info->epc1, info->epc2, info->epc3,
+        info->excvaddr, info->depc,
+        free_heap, max_block, frag_pct, rssi, rtc_valid);
+    } else {
+      syslog.logf(LOG_NOTICE,
+        "Boot #%u: reset=%s prev=%s heap=%u maxblk=%u frag=%u%% rssi=%d rtc=%d",
+        boot_info.boot_count, ESP.getResetReason().c_str(),
+        restart_reason_name(prev_reason),
+        free_heap, max_block, frag_pct, rssi, rtc_valid);
+    }
+  }
 
   ntp.begin();
 
@@ -1503,6 +1605,42 @@ typedef enum { SML_NONE=0, SML_OPEN=0x0101, SML_LIST=0x0701, SML_CLOSE=0x0201 } 
 // Returns false if power exceeds limits
 // A+ = consumption from grid (use USAGE_KW_MAX)
 // A- = production/feed-in to grid (use PROD_KW_MAX)
+// Sanity gates B2-B5 — catch SML bit-flip corruption before it can pollute
+// the baselines. B1 (CRC) runs upstream in read_serial_sml and counts but does
+// not yet reject. is_power_valid below handles delta-based bounds (the
+// original rejection logic). These gates check absolute magnitudes, meter
+// identity, and uptime monotonicity — orthogonal to the delta checks.
+static char locked_serial[10] = {0};
+static bool locked_serial_set = false;
+static const uint64_t MAX_RAW_1_10WH = 1000000000000ull;  // 100 GWh (residential ≪ this)
+
+static bool is_sane_itron(const itron_3hz_t *it, uint32_t last_uptime) {
+  // B5: meter id must be "ITR" (Itron). Other meters would need other ids; if
+  // the deployment ever changes, relax this. A corrupted frame had id='   '.
+  if( memcmp(it->id, "ITR", 3) != 0 ) return false;
+
+  // B3: absolute magnitudes plausible. Corruption produced values like
+  // 2.3e18 (1<<61) and 3.5e18; cap at 100 GWh = 1e12 in 1/10 Wh units.
+  if( it->aPlus  > MAX_RAW_1_10WH ) return false;
+  if( it->aMinus > MAX_RAW_1_10WH ) return false;
+
+  // B4: uptime must move forward and within a reasonable gap. The meter sends
+  // every ~1 s; >300 s gap is either a missed batch (we'd have logged the gap)
+  // or corruption. Skip on first reading (last_uptime==0).
+  if( last_uptime > 0 ) {
+    if( it->uptime <= last_uptime ) return false;
+    if( it->uptime - last_uptime > 300 ) return false;
+  }
+
+  // B2: once a serial is locked in, every subsequent frame must match. Catches
+  // the kind of corruption seen at 03:14 where the serial bytes were mangled
+  // but the parser still managed to set the valid bit.
+  if( locked_serial_set ) {
+    if( memcmp(it->serial, locked_serial, sizeof(locked_serial)) != 0 ) return false;
+  }
+  return true;
+}
+
 bool is_power_valid( uint64_t current_reading_1_10Wh, uint64_t previous_reading_1_10Wh, uint32_t delta_time_s, bool is_aplus ) {
   if( delta_time_s == 0 ) return true;  // skip validation on first reading
   
@@ -1644,106 +1782,69 @@ void parse_itron_3hz( itron_3hz_t *itron, size_t level, size_t pos, size_t type,
   }
 }
 
-char *spaces(char *s, size_t indent) {
-  while( indent-- ) {
-    *(s++) = ' ';
-    *(s++) = ' ';
-  }
-  return s;
-}
-
 /*
 SML parser (assuming valid SML 1.x)
- itron: pointer to structure to store relevant values
- data:  sml data of unknown length (whole record or list)
- items: list items (or high number if unknown)
- level: of nested lists
- */
-char *read_sml( itron_3hz_t *itron, char *data, size_t items, size_t level ) {
-  static char msg[1024];
-  size_t pos = 0;
+ itron:    pointer to structure to store relevant values
+ data:     pointer into sml record
+ data_end: one past the last valid byte in the record
+ items:    list items (or high number if unknown)
+ level:    of nested lists
 
-  while( items-- ) {
+A corrupted length tag or missing end-marker (type=0 len=0) used to let the
+parser walk past data_end into adjacent globals and eventually IRAM (caused
+the Exception/HW-Watchdog crash storm). Every access now bails if `data`
+would advance past `data_end`, and recursion is capped at 8 levels.
+ */
+static const size_t SML_MAX_LEVEL = 8;
+char *read_sml( itron_3hz_t *itron, char *data, char *data_end, size_t items, size_t level ) {
+  size_t pos = 0;
+  if( level > SML_MAX_LEVEL ) return data_end;
+
+  while( items-- && data < data_end ) {
     size_t type = (*data >> 4) & 0x7;
-    
+
     size_t len = *data & 0xf;
     while( *(data++) & 0x80 ) {
+      if( data >= data_end ) return data_end;
       len = (len << 4) + (*data & 0xf);
     }
 
-    //size_t l = len;  // for syslog length
     uint64_t u = 0;
     int64_t i = 0;
-    char *s;
 
     switch( type ) {
       case 0:  // octet
         if( len == 0 ) {
           parse_itron_3hz(itron, level, pos, type, 0);
-          // print end
-          s = spaces(msg, level);
-          snprintf(s, 4, "end");
-          //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
           return data;
         }
-        else {
-          parse_itron_3hz(itron, level, pos, type, data);
-          if( --len == 0 ) {
-            // print default
-            s = spaces(msg, level);
-            snprintf(s, 8, "default");
-            //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
-          } 
-          else {
-            // print string(len)
-            s = spaces(msg, level);
-            while( len-- ) {
-              snprintf(s, 4, "%02x ", *(data++));
-              s += 3;
-            }
-            //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
-          }
+        if( (size_t)(data_end - data) < len ) return data_end;
+        parse_itron_3hz(itron, level, pos, type, data);
+        if( --len > 0 ) {
+          data += len;  // skip the octet payload
         }
         break;
       case 4:  // bool
+        if( data >= data_end ) return data_end;
         parse_itron_3hz(itron, level, pos, type, data);
-        if( *(data++) ) {
-          // print true
-          s = spaces(msg, level);
-          snprintf(s, 5, "true");
-          //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
-        } else {
-          // print false
-          s = spaces(msg, level);
-          snprintf(s, 6, "false");
-          //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
-        }
+        data++;
         break;
       case 5:  // int
+        if( (size_t)(data_end - data) + 1 < len ) return data_end;
         while( len-- >= 2 ) {
           i = (i << 8) | *(data++);
         }
         parse_itron_3hz(itron, level, pos, type, &i);
-        // print i
-        s = spaces(msg, level);
-        snprintf(s, 20, "%lld", i);
-        //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
         break;
       case 6:  // unsigned int
+        if( (size_t)(data_end - data) + 1 < len ) return data_end;
         while (len-- >= 2) {
           u = (u << 8) | *(data++);
         }
         parse_itron_3hz(itron, level, pos, type, &u);
-        // print u
-        s = spaces(msg, level);
-        snprintf(s, 20, "%llu", u);
-        //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
         break;
       case 7:  // list
-        s = spaces(msg, level);
-        snprintf(s, 17, "list[%u]", len);
-        //syslog.logf(LOG_DEBUG, "Sml[%2u,%2u,%2u]=%s\n", pos, type, l, msg);
-        data = read_sml(itron, data, len, level + 1);
+        data = read_sml(itron, data, data_end, len, level + 1);
         break;
     }
     pos++;
@@ -1764,19 +1865,27 @@ void sml_data( char *data, size_t len ) {
   static uint32_t stat_backwards_runs = 0;  // separate backwards runs
   static uint32_t stat_max_bw_run     = 0;  // longest backwards run (lumping)
   static uint32_t stat_power          = 0;
+  static uint32_t stat_insane         = 0;
 
   sml_len = min(len, (size_t)sizeof(sml_raw));
   memcpy(sml_raw, data, sml_len);
 
   memset(&itron, 0, sizeof(itron));
-  read_sml(&itron, data, 0xffff, 0);
+  read_sml(&itron, data, data + len, 0xffff, 0);
   if( itron.valid == 0x3f ) {
     recv_time = time(NULL);
     recv_detailed = itron.detailed;
     stat_total++;
 
+    // B-checks: drop frames whose absolute values, id, serial, or uptime gap
+    // look impossible — independent of the delta-based is_power_valid below.
+    if( !is_sane_itron(&itron, last_uptime) ) {
+      stat_insane++;
+      syslog.logf(LOG_WARNING, "Insane SML frame dropped: %s", itronString(&itron));
+      itron.valid = 0;
+    }
     // Validate readings are within configured power limits
-    if( last_uptime > 0 ) {
+    else if( last_uptime > 0 ) {
       if( itron.aPlus < last_aPlus || itron.aMinus < last_aMinus ) {
         // Backwards counter: could be a bit-error (common, single occurrence) or
         // a genuine meter reset after power loss (sustained run of backwards values).
@@ -1832,6 +1941,14 @@ void sml_data( char *data, size_t len ) {
     // Store current values for next comparison (only if reading was valid)
     if( itron.valid == 0x3f ) {
       stat_accepted++;
+      // B2: lock the serial on the first frame that survives every gate. All
+      // future frames must match it or be dropped by is_sane_itron.
+      if( !locked_serial_set ) {
+        memcpy(locked_serial, itron.serial, sizeof(locked_serial));
+        locked_serial_set = true;
+        syslog.logf(LOG_NOTICE, "Locked meter serial = %s",
+                    to_hex(locked_serial, sizeof(locked_serial), '-'));
+      }
       last_uptime = itron.uptime;
       last_aPlus = itron.aPlus;
       last_aMinus = itron.aMinus;
@@ -1847,9 +1964,12 @@ void sml_data( char *data, size_t len ) {
   if( count > max_count ) {
     count = 0;
     syslog.logf(LOG_NOTICE,
-      "Stats: %u readings, %u accepted, %u backwards (%u runs, max %u in a row), %u power-rejected",
-      stat_total, stat_accepted, stat_backwards, stat_backwards_runs, stat_max_bw_run, stat_power);
-    stat_total = stat_accepted = stat_backwards = stat_backwards_runs = stat_max_bw_run = stat_power = 0;
+      "Stats: %u readings, %u accepted, %u backwards (%u runs, max %u in a row), %u power-rejected, %u insane, crc=%u/%u ovf=%u, heap=%u frag=%u%% rssi=%d",
+      stat_total, stat_accepted, stat_backwards, stat_backwards_runs, stat_max_bw_run, stat_power,
+      stat_insane, sml_crc_ok, sml_crc_bad, sml_overflow,
+      ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
+    stat_total = stat_accepted = stat_backwards = stat_backwards_runs = stat_max_bw_run = stat_power = stat_insane = 0;
+    sml_crc_ok = sml_crc_bad = sml_overflow = 0;
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
       post_data();
       #ifdef DTU_TOPIC
@@ -1877,27 +1997,48 @@ void sml_data( char *data, size_t len ) {
   #endif
 }
 
-typedef enum { MODE_NONE, MODE_START, MODE_VER, MODE_DATA, MODE_END, MODE_FINISH } read_mode_t;
+typedef enum { MODE_NONE, MODE_START, MODE_VER, MODE_DATA, MODE_END, MODE_FINISH,
+               MODE_PAD, MODE_CRC1, MODE_CRC2 } read_mode_t;
+
+// CRC-16/X25 (poly 0x1021 reflected, init 0xFFFF, refin/refout, xorout 0xFFFF).
+// SML appends this little-endian at the end of every envelope. Implemented
+// bit-wise to avoid a 512-byte lookup table; ~4096 ops for a 500 B frame.
+static inline uint16_t crc16_x25_byte(uint16_t crc, uint8_t b) {
+  crc ^= b;
+  for (uint8_t k = 0; k < 8; k++) {
+    crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : (crc >> 1);
+  }
+  return crc;
+}
 
 void read_serial_sml() {
-  static char data[2560];  // enough for 2s at 9600 baud
+  static char data[1024];           // raw SML payload (start/end escape stripped)
   static read_mode_t mode = MODE_NONE;
   static size_t count = 0;
+  static uint16_t crc = 0xFFFF;     // running envelope CRC
+  static uint8_t  pad_count = 0;    // padding bytes (from trailer 1a NN)
+  static uint16_t crc_recv = 0;     // little-endian CRC bytes from trailer
   int ch;
 
   while( (ch = Serial.read()) >= 0 ) {
     // Mirror all incoming data to IR LED output
     mirror.write(ch);
-    
+
+    // CRC covers the entire envelope from the very first 0x1b through the
+    // padding-count byte NN — but NOT the two CRC bytes themselves. The state
+    // machine feeds the CRC selectively per state below.
+
     switch( mode ) {
       case MODE_NONE:
         if( ch == 0x1b ) {
           mode = MODE_START;
           count = 1;
+          crc = crc16_x25_byte(0xFFFF, 0x1b);
         }
         break;
       case MODE_START:
         if( ch == 0x1b ) {
+          crc = crc16_x25_byte(crc, ch);
           if( ++count == 4 ) {
             mode = MODE_VER;
             count = 0;
@@ -1909,6 +2050,7 @@ void read_serial_sml() {
         break;
       case MODE_VER:
         if (ch == 0x01) {
+          crc = crc16_x25_byte(crc, ch);
           if (++count == 4) {
             mode = MODE_DATA;
             counter_events++;  // reset inactivity counter
@@ -1919,24 +2061,64 @@ void read_serial_sml() {
         }
         break;
       case MODE_DATA:
+        if( count >= sizeof(data) ) {  // A3 overflow guard
+          sml_overflow++;
+          mode = MODE_NONE;
+          break;
+        }
         data[count++] = ch;
+        crc = crc16_x25_byte(crc, ch);
         if( count % 4 == 1 && ch == 0x1b ) {
           mode = MODE_END;
         }
         break;
       case MODE_END:
+        if( count >= sizeof(data) ) {  // A3 overflow guard
+          sml_overflow++;
+          mode = MODE_NONE;
+          break;
+        }
         data[count++] = ch;
+        crc = crc16_x25_byte(crc, ch);
         if( count % 4 != 0 && ch != 0x1b ) {
           mode = MODE_DATA;
         }
         else if (count % 4 == 0 ) {
           mode = MODE_FINISH;
-          count -= 4;
+          count -= 4;  // trailing 1b 1b 1b 1b is part of CRC but not data
         }
         break;
       case MODE_FINISH:
+        crc = crc16_x25_byte(crc, ch);
         if (ch == 0x1a) {
-          sml_data(data, count);
+          mode = MODE_PAD;
+        } else {
+          mode = MODE_NONE;
+        }
+        break;
+      case MODE_PAD:
+        pad_count = ch;
+        crc = crc16_x25_byte(crc, ch);  // padding count IS part of CRC
+        mode = MODE_CRC1;
+        break;
+      case MODE_CRC1:
+        crc_recv = ch;  // little-endian: low byte first
+        mode = MODE_CRC2;
+        break;
+      case MODE_CRC2:
+        crc_recv |= ((uint16_t)ch) << 8;
+        {
+          uint16_t computed = (uint16_t)~crc;
+          if( computed == crc_recv ) {
+            sml_crc_ok++;
+            // Strip up to 3 padding bytes SML inserts to align data.
+            if( pad_count <= 3 && pad_count <= count ) count -= pad_count;
+            sml_data(data, count);
+          } else {
+            sml_crc_bad++;
+            // CRC mismatch: drop the frame. If our algorithm has a bug, every
+            // frame fails and Stats shows crc=0/N — revert if observed.
+          }
         }
         mode = MODE_NONE;
         break;

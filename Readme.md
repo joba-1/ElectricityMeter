@@ -37,6 +37,8 @@ Two classes of outlier are detected:
 
 **Power-limit spikes** — the energy delta between two consecutive readings implies a power level that exceeds the configured maximum, which is physically impossible and indicates a corrupt reading.
 
+**Frame-level corruption** (since v11.3) — every SML envelope's CRC-16 is verified before parsing, and the first valid frame's meter serial is "locked in" so later frames with a mismatching id/serial, impossible counter magnitudes, or unrealistic uptime jumps are dropped before they can pollute the baseline. Together these gates catch optical-IR bit errors that the delta-based check above cannot see.
+
 #### Syslog messages
 
 Every message below is at `LOG_NOTICE` or higher and appears under the device hostname.
@@ -47,8 +49,11 @@ Every message below is at `LOG_NOTICE` or higher and appears under the device ho
 | `Meter reset confirmed after N backwards readings, new baseline A+=X A-=Y` | N consecutive backwards readings were seen — interpreted as a genuine meter reset after power loss. The baseline is updated and the live power display is cleared. |
 | `Rejected: A+ delta=D/10 Wh in T s = K.KK kW, limit=L kW` | A+ energy jump of D/10 Wh over T seconds implies K.KK kW, exceeding the `USAGE_KW_MAX` limit of L kW. Reading discarded. |
 | `Rejected: A- delta=D/10 Wh in T s = K.KK kW, limit=L kW` | Same for A- (backfeed), compared against `PROD_KW_MAX`. |
-| `Stats: T readings, A accepted, B backwards (R runs, max M in a row), P power-rejected` | Periodic summary (~once per minute). T is total valid SML frames parsed; A accepted; B discarded as backwards across R separate runs with a longest run of M; P discarded for exceeding the power limit. |
+| `Stats: T readings, A accepted, B backwards (R runs, max M in a row), P power-rejected, I insane, crc=OK/BAD ovf=O, heap=H frag=F% rssi=R` | Periodic summary (~once per minute). T = SML frames that passed CRC and parsed cleanly; A accepted; B/P/I = rejections by category (see above); `crc=OK/BAD` = frames passing/failing CRC at the wire; `ovf` = oversized frames dropped; `heap`/`frag`/`rssi` give RAM and link-quality trend between Stats lines. |
 | `Itron valid=…` | Periodic confirmation of a good reading (once per minute). |
+| `Boot #N: reset=… prev=… heap=… maxblk=… frag=…% rssi=… rtc=…` | Emitted once per boot. `reset` is the ESP's own reason (`Software/System restart`, `Exception`, `Hardware Watchdog`, `External System`/brownout). `prev` shows whether the previous restart was a deliberate one (e.g. the web `/reset` endpoint) or an unexplained crash. The heap/RSSI snapshot helps spot creeping RAM exhaustion or weak WiFi over time. |
+| `Locked meter serial = …` | Logged once on the first valid SML frame after boot. All later frames must match this serial; otherwise they are dropped as `Insane SML frame dropped`. |
+| `Insane SML frame dropped: …` | A frame that parsed but failed a sanity gate (wrong meter id/serial, impossible counter magnitude, or unrealistic uptime gap). |
 
 #### Interpreting the Stats line
 
@@ -57,6 +62,9 @@ Every message below is at `LOG_NOTICE` or higher and appears under the device ho
 - `B>0, max>1` — consecutive backwards readings in a cluster. Runs of 2–3 occasionally happen; 4 means one more would have triggered a meter-reset declaration.
 - `max≥5` — a meter reset was confirmed; check for a preceding `Meter reset confirmed` warning.
 - `P>0` — power-limit spikes occurred; inspect the individual `Rejected` lines to see how far the values exceeded the threshold. If the computed kW is only marginally above the limit, consider raising `USAGE_KW_MAX` / `PROD_KW_MAX`.
+- `crc=OK/BAD` — a small bad count (a few percent) is normal noise from the optical IR link. A bad count comparable to OK suggests the sensor positioning has drifted; reseat the IR head.
+- `I>0` — sanity gates dropped a frame. Look at the preceding `Insane SML frame dropped` line for which field was out of bounds.
+- Repeated `Boot #N` lines minutes apart point to firmware crashes; check the `reset=` field — `Exception` and `Hardware Watchdog` are bugs, `External System` is a brownout / power glitch, `Software/System restart` after a `/reset` POST or a flash is expected.
 
 ### WLED Visual Feedback
 Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).
