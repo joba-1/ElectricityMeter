@@ -66,6 +66,20 @@ Every message below is at `LOG_NOTICE` or higher and appears under the device ho
 - `I>0` — sanity gates dropped a frame. Look at the preceding `Insane SML frame dropped` line for which field was out of bounds.
 - Repeated `Boot #N` lines minutes apart point to firmware crashes; check the `reset=` field — `Exception` and `Hardware Watchdog` are bugs, `External System` is a brownout / power glitch, `Software/System restart` after a `/reset` POST or a flash is expected.
 
+### InfluxDB Storage
+
+Accepted readings are posted to InfluxDB 1.x on host `job4`, database `power`, measurement
+`energy`, tag `meter=<10-byte serial>`. Two integer fields are written:
+
+| Field | Stores | Note |
+|-------|--------|------|
+| `watt` | A+ counter (consumption) in **Wh** | Despite the name, **not** instantaneous watts. Computed as `(aPlus + 5) / 10` from the raw 1/10 Wh meter counter. |
+| `watt_out` | A- counter (backfeed) in **Wh** | Same misnomer. |
+
+Both names are historical and kept for Grafana/InfluxDB compatibility. To get instantaneous
+power in watts from these cumulative counters, apply a derivative, e.g.
+`SELECT derivative(mean("watt"), 1s) * 3600 FROM energy WHERE time > now() - 1h GROUP BY time(1m)`.
+
 ### WLED Visual Feedback
 Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).
 
