@@ -1467,6 +1467,10 @@ void setup() {
 
   WiFiManager wm;
   // wm.resetSettings();
+  // If the home AP is briefly unreachable at boot (router restart, brownout
+  // overlap), WiFiManager would otherwise sit in config-portal AP mode forever.
+  // Give up after 3 min, let the existing restart path retry the saved SSID.
+  wm.setConfigPortalTimeout(180);
   if (!wm.autoConnect()) {
     Serial.println("Failed to connect WLAN");
     for (int i = 0; i < 1000; i += 200) {
