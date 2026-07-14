@@ -1969,6 +1969,13 @@ void sml_data( char *data, size_t len ) {
       meter_seen = true;
       update_period_baselines();
       update_power();
+      // Publish the kWh totals on every valid frame (~1/s) so they appear
+      // promptly after a reboot instead of waiting for the once-per-minute
+      // InfluxDB post below. publish_data() self-dedupes, so this is nearly
+      // free and never spams the broker.
+      #ifdef DTU_TOPIC
+      publish_data();
+      #endif
     }
   }
 
@@ -1983,10 +1990,7 @@ void sml_data( char *data, size_t len ) {
     stat_total = stat_accepted = stat_backwards = stat_backwards_runs = stat_max_bw_run = stat_power = stat_insane = 0;
     sml_crc_ok = sml_crc_bad = sml_overflow = 0;
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
-      post_data();
-      #ifdef DTU_TOPIC
-      publish_data();
-      #endif
+      post_data();  // InfluxDB stays on the once-per-minute cadence
       if( recv_detailed ) {
         syslog.logf(LOG_NOTICE, "Itron %s", itronString(&itron));
       }
