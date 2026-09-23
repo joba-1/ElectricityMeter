@@ -4,7 +4,7 @@
 #define ELECTRICITYMETER_BUILD_CONFIG_H
 
 #ifndef VERSION
-#define VERSION "11.6"
+#define VERSION "11.7"
 #endif
 
 #ifndef PROGNAME
@@ -20,7 +20,7 @@
 #endif
 
 #ifndef INFLUX_SERVER
-#define INFLUX_SERVER "job4"
+#define INFLUX_SERVER "influx"
 #endif
 
 #ifndef INFLUX_PORT
@@ -28,7 +28,7 @@
 #endif
 
 #ifndef SYSLOG_SERVER
-#define SYSLOG_SERVER "job4"
+#define SYSLOG_SERVER "syslog"
 #endif
 
 #ifndef SYSLOG_PORT
@@ -72,7 +72,7 @@
 #endif
 
 #ifndef MQTT_BROKER
-#define MQTT_BROKER "job4"
+#define MQTT_BROKER "mqtt"
 #endif
 
 #ifndef MQTT_PORT

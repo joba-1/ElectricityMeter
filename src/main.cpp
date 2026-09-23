@@ -59,6 +59,41 @@ static char start_time[30] = "";
 WiFiUDP logUDP;
 Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
 
+// Runtime-configurable hosts: EEPROM over build-flag defaults (see NetConfig.h)
+#include "NetConfig.h"
+NetConfig netConfig(SYSLOG_SERVER, SYSLOG_PORT, INFLUX_SERVER, INFLUX_PORT,
+                    MQTT_BROKER, MQTT_PORT, NTP_SERVER, WLED_HOST);
+
+// Status of the external resources for /api/netstatus (millis() stamps, 0 = never)
+uint32_t syslog_sent = 0, syslog_failed = 0, syslog_last_ok_ms = 0;
+uint32_t influx_last_ok_ms = 0, influx_failures = 0;
+uint32_t mqtt_last_connect_ms = 0, mqtt_connect_failures = 0, mqtt_last_publish_ms = 0;
+int mqtt_last_rc = -99;
+uint32_t ntp_last_ok_ms = 0, wled_last_ok_ms = 0, wled_failures = 0;
+
+// Admin login for /update, /reset and POST /api/netconfig. The password comes
+// from the untracked secrets.ini (pio_secrets.py); without it there is no lock.
+#ifndef ADMIN_PASSWORD
+#define ADMIN_PASSWORD ""
+#endif
+static const char admin_user[] = "admin";
+
+bool slog(uint16_t pri, const char *message) {
+  bool ok = syslog.log(pri, message);
+  if (ok) { syslog_sent++; syslog_last_ok_ms = millis(); } else { syslog_failed++; }
+  return ok;
+}
+
+bool slogf(uint16_t pri, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+bool slogf(uint16_t pri, const char *fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  return slog(pri, buf);
+}
+
 // ---- Boot diagnostics ----
 // RTC user memory survives ESP.restart() and exception/WDT crashes; it is
 // only cleared on a real power-off. We stash a reason code before any
@@ -155,7 +190,10 @@ void post_data() {
   char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
   snprintf(msg, sizeof(msg), fmt, serial, (itron.aPlus+5)/10, (itron.aMinus+5)/10);
 
-  http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
+  const NetConfig::Values &net = netConfig.active();
+  if (!net.influxHost[0]) return;   // InfluxDB disabled
+  http.setTimeout(2000);
+  http.begin(client, net.influxHost, net.influxPort, uri);
   http.setUserAgent(PROGNAME);
   influx_status = http.POST(msg);
 
@@ -165,10 +203,12 @@ void post_data() {
     String payload = http.getString();
     http.end();
     breathe_interval = err_interval;
-    syslog.logf(LOG_ERR, "Post %s:%d%s status=%d msg='%s' response='%s'", INFLUX_SERVER,
-                INFLUX_PORT, uri, influx_status, msg, payload.c_str());
+    influx_failures++;
+    slogf(LOG_ERR, "Post %s:%u%s status=%d msg='%s' response='%s'", net.influxHost,
+                net.influxPort, uri, influx_status, msg, payload.c_str());
   } else {
     http.end();
+    influx_last_ok_ms = millis();
     breathe_interval = ok_interval;
     post_time = time(NULL);
   };
@@ -221,7 +261,7 @@ static int8_t wled_live_en = -1;
 static int8_t wled_fetch_live_en() {
   WiFiClient wc;
   HTTPClient wh;
-  if( !wh.begin(wc, WLED_HOST, 80, "/json/cfg") ) return -1;
+  if( !wh.begin(wc, netConfig.active().wledHost, 80, "/json/cfg") ) return -1;
   int st = wh.GET();
   if( st != 200 ) { wh.end(); return -1; }
   String body = wh.getString();
@@ -236,7 +276,7 @@ static int8_t wled_fetch_live_en() {
 static bool wled_post_live_en(bool enable) {
   WiFiClient wc;
   HTTPClient wh;
-  if( !wh.begin(wc, WLED_HOST, 80, "/json/cfg") ) return false;
+  if( !wh.begin(wc, netConfig.active().wledHost, 80, "/json/cfg") ) return false;
   wh.addHeader("Content-Type", "application/json");
   int st = wh.POST(enable ? String("{\"if\":{\"live\":{\"en\":true}}}")
                            : String("{\"if\":{\"live\":{\"en\":false}}}"));
@@ -265,7 +305,7 @@ Send MQTT request to change power limit if it changed
 Limit is rounded to full 100W  
 */
 void publish_limit( uint64_t prod, uint16_t limit ) {
-  /// syslog.logf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
+  /// slogf(LOG_INFO, "publish_limit for prod %llu: %u W", prod, limit);
 
   limit = ((limit + LIMIT_ROUND_GRANULARITY/2) / LIMIT_ROUND_GRANULARITY) * LIMIT_ROUND_GRANULARITY;  // round limit
 
@@ -274,17 +314,17 @@ void publish_limit( uint64_t prod, uint16_t limit ) {
     snprintf(payload, sizeof(payload), "%u", limit);
 
     if( !mqtt.connected() || (dynamic && !mqtt.publish(DTU_TOPIC "/" INVERTER_SERIAL "/cmd/limit_nonpersistent_absolute", payload))) {
-      syslog.logf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
+      slogf(LOG_ERR, "Mqtt publish limit %s for inverter '%s' failed", payload, inverter);
     }
     else if (dynamic) {
-      syslog.logf(LOG_NOTICE, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
+      slogf(LOG_NOTICE, "Producing %llu W -> change nonpersistent limit of inverter '%s' from %u to %s W", prod, inverter, curr_limit, payload);
     }
     else {
-      syslog.logf(LOG_NOTICE, "Producing %llu W -> no change of limit for inverter '%s' from %u to %s W due to topic '%s' is not 1", prod, inverter, curr_limit, payload, topic_dynamic);
+      slogf(LOG_NOTICE, "Producing %llu W -> no change of limit for inverter '%s' from %u to %s W due to topic '%s' is not 1", prod, inverter, curr_limit, payload, topic_dynamic);
     }
   }
   else {
-      syslog.logf(LOG_NOTICE, "Producing %llu W -> rounded limit for inverter '%s' of %u W still the same", prod, inverter, curr_limit);
+      slogf(LOG_NOTICE, "Producing %llu W -> rounded limit for inverter '%s' of %u W still the same", prod, inverter, curr_limit);
   }
 }
 
@@ -310,7 +350,7 @@ void check_limit() {
       // calculate average backfeed in W from the ever increasing backfeed counter
       // and the elapsed time since last check
       aMinusW = (itron.aMinus - aMinus) * 360 / delta_t;
-      /// syslog.logf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
+      /// slogf(LOG_INFO, "Check: Curr A-: %llu W, dt = %u s", aMinusW, delta_t);
     
       if( curr_limit != UINT16_MAX && reachable ) {
         // only try to change the limit if the current limit is known 
@@ -328,11 +368,11 @@ void check_limit() {
           publish_limit(aMinusW, (curr_limit + delta < max_limit) ? curr_limit + delta : max_limit);
         }
         else {
-          /// syslog.logf(LOG_INFO, "Check: current limit %u W not changed for prod %llu W", curr_limit, aMinusW);
+          /// slogf(LOG_INFO, "Check: current limit %u W not changed for prod %llu W", curr_limit, aMinusW);
         }
       }
       else {
-        /// syslog.logf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
+        /// slogf(LOG_INFO, "Check: current limit %u W not changed, elapsed since update: %u s", curr_limit, (now - update_ms)/1000);
       }
       uptime = itron.uptime;
       aMinus = itron.aMinus;
@@ -351,14 +391,14 @@ void publish_data() {
   if( aPlusW != lastAPlusW ) {
     char wh[20];
     snprintf(wh, sizeof(wh), "%llu", aPlusW);
-    mqtt.publish(HOSTNAME "/Wh_In", wh);
+    if (mqtt.publish(HOSTNAME "/Wh_In", wh)) mqtt_last_publish_ms = millis();
     lastAPlusW = aPlusW;
   }
 
   if( aMinusW != lastAMinusW ) {
     char wh[20];
     snprintf(wh, sizeof(wh), "%llu", aMinusW);
-    mqtt.publish(HOSTNAME "/Wh_Out", wh);
+    if (mqtt.publish(HOSTNAME "/Wh_Out", wh)) mqtt_last_publish_ms = millis();
     lastAMinusW = aMinusW;
   }
 }
@@ -369,7 +409,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if( length > 0 ) {
       bool flag = payload[0] != '0';
       if( flag != reachable ) {
-          syslog.logf(LOG_NOTICE, "Inverter '%s' is %s", inverter, flag ? "reachable" : "unreachable");
+          slogf(LOG_NOTICE, "Inverter '%s' is %s", inverter, flag ? "reachable" : "unreachable");
           reachable = flag;
       }
     }
@@ -382,7 +422,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       if( endp != str && limit < UINT16_MAX ) {
         limit = ((limit + LIMIT_ROUND_GRANULARITY/2) / LIMIT_ROUND_GRANULARITY) * LIMIT_ROUND_GRANULARITY;
         if( limit != curr_limit ) {
-          syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %lu W", inverter, limit);
+          slogf(LOG_NOTICE, "Inverter '%s' limit is %lu W", inverter, limit);
           curr_limit = limit;
         }
       }
@@ -394,7 +434,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       if( len != strlen(inverter) || strncmp(inverter, (char *)payload, len)) {
         strncpy(inverter, (char *)payload, len);
         inverter[len] = '\0';
-        syslog.logf(LOG_NOTICE, "Inverter name is '%s'", inverter);
+        slogf(LOG_NOTICE, "Inverter name is '%s'", inverter);
       }
     }
   }
@@ -404,12 +444,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       flag = payload[0] == '1';
     }
     if( flag != dynamic ) {
-        syslog.logf(LOG_NOTICE, "Inverter '%s' limit is %s", inverter, flag ? "dynamic" : "static");
+        slogf(LOG_NOTICE, "Inverter '%s' limit is %s", inverter, flag ? "dynamic" : "static");
         dynamic = flag;
     }
   }
   else {
-    syslog.logf(LOG_ERR, "Unknown topic '%s'", topic);
+    slogf(LOG_ERR, "Unknown topic '%s'", topic);
   }
 }
 
@@ -434,14 +474,20 @@ void handle_mqtt() {
       && mqtt.subscribe(topic_limit)
       && mqtt.subscribe(topic_dynamic)
       && mqtt.subscribe(topic_name)) {
-        snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, HOSTNAME);
-        syslog.log(LOG_NOTICE, msg);
+        mqtt_last_connect_ms = millis();
+        mqtt_last_rc = mqtt.state();
+        snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%u using topic %s",
+          netConfig.active().mqttHost, netConfig.active().mqttPort, HOSTNAME);
+        slog(LOG_NOTICE, msg);
       }
       else {
         int error = mqtt.state();
+        mqtt_last_rc = error;
+        mqtt_connect_failures++;
         mqtt.disconnect();
-        snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%d failed with code %d", MQTT_BROKER, MQTT_PORT, error);
-        syslog.log(LOG_ERR, msg);
+        snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%u failed with code %d",
+          netConfig.active().mqttHost, netConfig.active().mqttPort, error);
+        slog(LOG_ERR, msg);
       }
     }
   }
@@ -538,7 +584,9 @@ static bool refresh_rolling_edges() {
       i ? "%3B" : "", edge_offset[i]);
   }
 
-  http.begin(client, INFLUX_SERVER, INFLUX_PORT, url);
+  if (!netConfig.active().influxHost[0]) return false;   // InfluxDB disabled
+  http.setTimeout(2000);
+  http.begin(client, netConfig.active().influxHost, netConfig.active().influxPort, url);
   http.setUserAgent(PROGNAME);
   http.addHeader("Accept", "application/csv");
   int code = http.GET();
@@ -564,11 +612,11 @@ static bool refresh_rolling_edges() {
       edges_ready = true;
       ok = true;
     }
-    syslog.logf(LOG_NOTICE, "Rolling edges refreshed: %d/%d windows", got, EDGE_COUNT);
+    slogf(LOG_NOTICE, "Rolling edges refreshed: %d/%d windows", got, EDGE_COUNT);
   }
   http.end();
   if( !ok ) {
-    syslog.logf(LOG_NOTICE, "Influx rolling-edge query http=%d (no data?)", code);
+    slogf(LOG_NOTICE, "Influx rolling-edge query http=%d (no data?)", code);
   }
   return ok;
 }
@@ -782,7 +830,7 @@ void update_power() {
   }
   if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
     // Anchor is ahead of current reading — reset so we re-init on the next call.
-    syslog.logf(LOG_WARNING, "Live power anchor reset: A+=%llu<%llu or A-=%llu<%llu",
+    slogf(LOG_WARNING, "Live power anchor reset: A+=%llu<%llu or A-=%llu<%llu",
       itron.aPlus, live_power.aPlus, itron.aMinus, live_power.aMinus);
     live_power = power_state_t{};
     return;
@@ -809,7 +857,7 @@ void update_power() {
     // Guard against impossible values (e.g. from dt being tiny due to uptime glitch).
     uint64_t max_w = (uint64_t)max(USAGE_KW_MAX, PROD_KW_MAX) * 10000ULL;
     if( live_power.aPlusW > max_w || live_power.aMinusW > max_w ) {
-      syslog.logf(LOG_WARNING, "Live power out of range: A+W=%llu A-W=%llu (1/10W); resetting",
+      slogf(LOG_WARNING, "Live power out of range: A+W=%llu A-W=%llu (1/10W); resetting",
         live_power.aPlusW, live_power.aMinusW);
       live_power = power_state_t{};
     }
@@ -840,12 +888,12 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
       // Above threshold: advance entry timer, cancel the cancel-timer.
       if( !st.enter_ms ) {
         st.enter_ms = now_ms;
-        syslog.logf(LOG_INFO, "WLED %s pending on", name);
+        slogf(LOG_INFO, "WLED %s pending on", name);
       } else if( now_ms - st.enter_ms >= pend_ms ) {
         st.active   = true;
         st.enter_ms = 0;
         st.exit_ms  = 0;
-        syslog.logf(LOG_NOTICE, "WLED %s on", name);
+        slogf(LOG_NOTICE, "WLED %s on", name);
       }
       st.exit_ms = 0;  // reset cancel-timer while above entry threshold
     } else if( exit_cond ) {
@@ -854,7 +902,7 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
       if( !st.exit_ms ) {
         st.exit_ms = now_ms;
       } else if( now_ms - st.exit_ms >= pend_ms ) {
-        if( st.enter_ms ) syslog.logf(LOG_INFO, "WLED %s pending on cancelled", name);
+        if( st.enter_ms ) slogf(LOG_INFO, "WLED %s pending on cancelled", name);
         st.enter_ms = 0;
         st.exit_ms  = 0;
       }
@@ -867,16 +915,16 @@ static void wled_update_state(WledColorState &st, bool entry_cond, bool exit_con
     if( exit_cond ) {
       if( !st.exit_ms ) {
         st.exit_ms = now_ms;
-        syslog.logf(LOG_INFO, "WLED %s pending off", name);
+        slogf(LOG_INFO, "WLED %s pending off", name);
       } else if( now_ms - st.exit_ms >= pend_ms ) {
         st.active  = false;
         st.exit_ms = 0;
-        syslog.logf(LOG_NOTICE, "WLED %s off", name);
+        slogf(LOG_NOTICE, "WLED %s off", name);
       }
     } else {
       if( st.exit_ms ) {
         st.exit_ms = 0;
-        syslog.logf(LOG_INFO, "WLED %s pending off cancelled", name);
+        slogf(LOG_INFO, "WLED %s pending off cancelled", name);
       }
     }
   }
@@ -948,7 +996,7 @@ void send_wled() {
       bl += snprintf(buf + bl, sizeof(buf) - bl, "%s%s%s in %d s",
         bl ? ", " : "", cn[i], pend_off ? " off" : "", rem);
     }
-    if( bl ) syslog.logf(LOG_INFO, "WLED pending: %s active, %s", wled_active_color_name(), buf);
+    if( bl ) slogf(LOG_INFO, "WLED pending: %s active, %s", wled_active_color_name(), buf);
     wled_last_log_ms = now_ms;
   }
 
@@ -969,7 +1017,7 @@ void send_wled() {
   if( now_ms - last_send_ms < (uint32_t)(wled_secs / 2) * 1000 ) return;
 
   if( r || g || b ) {
-    if( wledUDP.beginPacket(WLED_HOST, WLED_PORT) ) {
+    if( netConfig.active().wledHost[0] && wledUDP.beginPacket(netConfig.active().wledHost, WLED_PORT) ) {
       wledUDP.write(2);  // WLED proto DRGB
       wledUDP.write(wled_secs);
       int led = WLED_LEDS;
@@ -978,12 +1026,13 @@ void send_wled() {
         wledUDP.write(g);
         wledUDP.write(b);
       }
-      wledUDP.endPacket();
+      if (wledUDP.endPacket()) { wled_last_ok_ms = millis(); } else { wled_failures++; }
       last_send_ms = now_ms;
       wled_update  = now_ms;
-      syslog.logf(LOG_INFO, "WLED UDP sent: %s rgb(%u,%u,%u)", wled_active_color_name(), r, g, b);
+      slogf(LOG_INFO, "WLED UDP sent: %s rgb(%u,%u,%u)", wled_active_color_name(), r, g, b);
     } else {
-      syslog.logf(LOG_WARNING, "WLED UDP beginPacket failed for %s:%d", WLED_HOST, WLED_PORT);
+      wled_failures++;
+      slogf(LOG_WARNING, "WLED UDP beginPacket failed for %s:%d", netConfig.active().wledHost, WLED_PORT);
     }
   }
 }
@@ -1052,13 +1101,13 @@ void send_main_page() {
     "<div class=\"card\"><h2>Status</h2><table>"
     "<tr><th>Meter</th><td>%3.3s &middot; <code>%s</code></td></tr>"
     "<tr><th>Detailed readings</th><td>%s</td></tr>"
-    "<tr><th>InfluxDB</th><td><code>" INFLUX_SERVER "</code> status %d</td></tr>"
+    "<tr><th>InfluxDB</th><td><code>%s</code> status %d</td></tr>"
     "<tr><th>Last update</th><td>%s</td></tr>"
     "</table></div>",
     itron.id, serial_str,
     recv_detailed ? "<span class=\"pos\">yes (1/10 Wh)</span>"
                   : "<span class=\"neg\">no (kWh only)</span>",
-    influx_status, curr_time);
+    netConfig.active().influxHost, influx_status, curr_time);
   web_server.sendContent(web_buf);
 
 #ifdef DTU_TOPIC
@@ -1106,13 +1155,13 @@ void send_main_page() {
     }
     snprintf(web_buf, sizeof(web_buf),
       "<div class=\"card\"><h2>WLED</h2><table>"
-      "<tr><th>Host</th><td><code>" WLED_HOST ":%d</code> &middot; %d LEDs</td></tr>"
+      "<tr><th>Host</th><td><code>%s:%d</code> &middot; %d LEDs</td></tr>"
       "<tr><th>Color</th><td><span class=\"swatch\" style=\"background:#%06x\"></span>"
       "<code>%s</code></td></tr>"
       "<tr id=\"wled_pending_row\"%s>"
       "<th>Pending</th><td id=\"wled_pending_cell\">%s</td></tr>"
       "</table></div>",
-      WLED_PORT, WLED_LEDS,
+      netConfig.active().wledHost, WLED_PORT, WLED_LEDS,
       color_int, wled_active_color_name(),
       pl ? "" : " style=\"display:none\"",
       pend);
@@ -1144,6 +1193,113 @@ static size_t emit_period_json( char *buf, size_t bufsize, const char *key,
 }
 
 // Define web pages for update, reset or for event infos
+// true if allowed; otherwise answers with a 401 challenge
+bool admin_ok() {
+  if (!ADMIN_PASSWORD[0] || web_server.authenticate(admin_user, ADMIN_PASSWORD)) {
+    return true;
+  }
+  web_server.requestAuthentication(BASIC_AUTH, PROGNAME);
+  return false;
+}
+
+// JSON string with quotes/backslashes/control chars escaped (SSIDs are user data)
+String json_str(const char *v) {
+  String out("\"");
+  for (const char *p = v; *p; p++) {
+    if (*p == '"' || *p == '\\') { out += '\\'; out += *p; }
+    else if ((unsigned char)*p >= 0x20) { out += *p; }
+  }
+  out += '"';
+  return out;
+}
+
+long age_s(uint32_t ms) { return ms ? (long)((millis() - ms) / 1000) : -1L; }
+
+String netvalues_json(const NetConfig::Values &v) {
+  char buf[600];
+  snprintf(buf, sizeof(buf),   // validated host names need no escaping
+    "{\"syslogHost\":\"%s\",\"syslogPort\":%u,\"influxHost\":\"%s\",\"influxPort\":%u,"
+    "\"mqttHost\":\"%s\",\"mqttPort\":%u,\"ntp\":\"%s\",\"wledHost\":\"%s\"}",
+    v.syslogHost, v.syslogPort, v.influxHost, v.influxPort, v.mqttHost, v.mqttPort, v.ntp, v.wledHost);
+  return String(buf);
+}
+
+String netconfig_json() {
+  return String("{\"source\":\"") + (netConfig.fromFlash() ? "flash" : "defaults")
+    + "\",\"active\":" + netvalues_json(netConfig.active())
+    + ",\"defaults\":" + netvalues_json(netConfig.defaults()) + "}";
+}
+
+String netstatus_json() {
+  const NetConfig::Values &v = netConfig.active();
+  char buf[1200];
+  snprintf(buf, sizeof(buf),
+    "{\"firmware\":{\"name\":\"" PROGNAME "\",\"version\":\"" VERSION "\",\"built\":\"" __DATE__ " " __TIME__ "\"},"
+    "\"device\":{\"hostname\":\"" HOSTNAME "\",\"ip\":\"%s\",\"mac\":\"%s\",\"ssid\":%s,\"rssi\":%d,\"uptimeS\":%lu,\"adminLock\":%s},"
+    "\"configSource\":\"%s\","
+    "\"resources\":{"
+    "\"syslog\":{\"host\":\"%s\",\"port\":%u,\"sent\":%lu,\"failed\":%lu,\"lastOkAgeS\":%ld},"
+    "\"influx\":{\"host\":\"%s\",\"port\":%u,\"database\":\"" INFLUX_DB "\",\"lastHttpCode\":%d,\"lastOkAgeS\":%ld,\"failures\":%lu},"
+    "\"mqtt\":{\"host\":\"%s\",\"port\":%u,\"connected\":%s,\"lastConnectAgeS\":%ld,\"lastRc\":%d,\"connectFailures\":%lu,\"lastPublishAgeS\":%ld},"
+    "\"ntp\":{\"server\":\"%s\",\"synced\":%s,\"lastOkAgeS\":%ld},"
+    "\"wled\":{\"host\":\"%s\",\"port\":%u,\"lastOkAgeS\":%ld,\"failures\":%lu}}}",
+    WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str(), json_str(WiFi.SSID().c_str()).c_str(),
+    (int)WiFi.RSSI(), (unsigned long)(millis() / 1000), ADMIN_PASSWORD[0] ? "true" : "false",
+    netConfig.fromFlash() ? "flash" : "defaults",
+    v.syslogHost, v.syslogPort, (unsigned long)syslog_sent, (unsigned long)syslog_failed, age_s(syslog_last_ok_ms),
+    v.influxHost, v.influxPort, influx_status, age_s(influx_last_ok_ms), (unsigned long)influx_failures,
+    v.mqttHost, v.mqttPort, mqtt.connected() ? "true" : "false", age_s(mqtt_last_connect_ms), mqtt_last_rc,
+    (unsigned long)mqtt_connect_failures, age_s(mqtt_last_publish_ms),
+    v.ntp, ntp.isTimeSet() ? "true" : "false", age_s(ntp_last_ok_ms),
+    v.wledHost, (unsigned)WLED_PORT, age_s(wled_last_ok_ms), (unsigned long)wled_failures);
+  return String(buf);
+}
+
+// Apply one form field: false if present but too long / not a port
+bool apply_str(const char *name, char *dst, size_t cap) {
+  return !web_server.hasArg(name) || NetConfigValidate::copyField(dst, cap, web_server.arg(name).c_str());
+}
+bool apply_port(const char *name, uint16_t &dst) {
+  return !web_server.hasArg(name) || NetConfigValidate::parsePort(web_server.arg(name).c_str(), dst);
+}
+
+void netconfig_error(int code, const char *err, const char *field) {
+  char buf[96];
+  snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"field\":\"%s\"}", err, field ? field : "");
+  web_server.send(code, "application/json", buf);
+}
+
+bool should_reboot = false;   // handled in loop() after the answer went out
+uint32_t reboot_at = 0;
+
+// POST /api/netconfig: syslogHost/Port, influxHost/Port, mqttHost/Port, ntp, wledHost; defaults=1; reboot=0
+void handle_netconfig_post() {
+  bool to_defaults = web_server.arg("defaults") == "1";
+  bool reboot = web_server.arg("reboot") != "0";
+  NetConfig::Values v = netConfig.active();
+  const char *bad = nullptr;
+  if (to_defaults) {
+    if (!netConfig.clear()) return netconfig_error(500, "eeprom clear failed", nullptr);
+    v = netConfig.defaults();
+  } else {
+    if (!apply_str("syslogHost", v.syslogHost, sizeof(v.syslogHost))) bad = "syslogHost";
+    else if (!apply_str("influxHost", v.influxHost, sizeof(v.influxHost))) bad = "influxHost";
+    else if (!apply_str("mqttHost", v.mqttHost, sizeof(v.mqttHost))) bad = "mqttHost";
+    else if (!apply_str("ntp", v.ntp, sizeof(v.ntp))) bad = "ntp";
+    else if (!apply_str("wledHost", v.wledHost, sizeof(v.wledHost))) bad = "wledHost";
+    else if (!apply_port("syslogPort", v.syslogPort)) bad = "syslogPort";
+    else if (!apply_port("influxPort", v.influxPort)) bad = "influxPort";
+    else if (!apply_port("mqttPort", v.mqttPort)) bad = "mqttPort";
+    else NetConfig::validate(v, &bad);
+    if (bad) return netconfig_error(400, "invalid value", bad);
+    if (!netConfig.save(v, &bad)) return netconfig_error(500, "eeprom write failed", bad);
+  }
+  if (reboot) { should_reboot = true; reboot_at = millis() + 1000; }
+  web_server.send(200, "application/json",
+    String("{\"ok\":true,\"source\":\"") + (to_defaults ? "defaults" : "flash")
+    + "\",\"values\":" + netvalues_json(v) + ",\"reboot\":" + (reboot ? "true" : "false") + "}");
+}
+
 void setup_webserver() {
   // AJAX-friendly stats endpoint (separate from the stable /json API).
   // Returns instant power, meter totals (kWh) and per-period consumption (kWh, or null).
@@ -1233,8 +1389,21 @@ void setup_webserver() {
   });
 
   // Reset the ESP (POST only)
+  // Runtime network configuration and status (see Readme.md)
+  web_server.on("/api/netstatus", HTTP_GET, []() {
+    web_server.send(200, "application/json", netstatus_json());
+  });
+  web_server.on("/api/netconfig", HTTP_GET, []() {
+    web_server.send(200, "application/json", netconfig_json());
+  });
+  web_server.on("/api/netconfig", HTTP_POST, []() {
+    if (!admin_ok()) return;
+    handle_netconfig_post();
+  });
+
   web_server.on("/reset", HTTP_POST, []() {
-    syslog.log(LOG_NOTICE, "RESET");
+    if (!admin_ok()) return;
+    slog(LOG_NOTICE, "RESET");
     send_html_head(200, "<meta http-equiv=\"refresh\" content=\"7; url=/\">");
     send_nav("");
     web_server.sendContent_P(PSTR(
@@ -1314,7 +1483,7 @@ void setup_webserver() {
       parseRGB("red_color",   cfg_red.r,   cfg_red.g,   cfg_red.b);
       cfg_violet.pend_ms     = getU32("violet_delay", cfg_violet.pend_ms/1000) * 1000;
       parseRGB("violet_color",cfg_violet.r,cfg_violet.g,cfg_violet.b);
-      syslog.logf(LOG_NOTICE, "WLED cfg: green>%uW hyst%u d%us, blue>%uW hyst%u d%us, red>%uW hyst%u d%us, violet d%us",
+      slogf(LOG_NOTICE, "WLED cfg: green>%uW hyst%u d%us, blue>%uW hyst%u d%us, red>%uW hyst%u d%us, violet d%us",
         cfg_green.threshold_w, cfg_green.hyst_w, cfg_green.pend_ms/1000,
         cfg_blue.threshold_w,  cfg_blue.hyst_w,  cfg_blue.pend_ms/1000,
         cfg_red.threshold_w,   cfg_red.hyst_w,   cfg_red.pend_ms/1000,
@@ -1412,9 +1581,9 @@ void setup_webserver() {
       bool ok = wled_post_live_en(en);
       if( ok ) {
         wled_live_en = en ? 1 : 0;
-        syslog.logf(LOG_NOTICE, "WLED live receive %s", en ? "enabled" : "disabled");
+        slogf(LOG_NOTICE, "WLED live receive %s", en ? "enabled" : "disabled");
       } else {
-        syslog.logf(LOG_WARNING, "WLED live receive change failed");
+        slogf(LOG_WARNING, "WLED live receive change failed");
       }
     }
     web_server.sendHeader("Location", "/wled");
@@ -1441,7 +1610,7 @@ void setup_webserver() {
   web_server.begin();
 
   MDNS.addService("http", "tcp", WEBSERVER_PORT);
-  syslog.logf(LOG_NOTICE, "Serving HTTP on port %d", WEBSERVER_PORT);
+  slogf(LOG_NOTICE, "Serving HTTP on port %d", WEBSERVER_PORT);
 }
 
 void setup() {
@@ -1457,8 +1626,13 @@ void setup() {
 
   mirror.begin(SERIAL_SPEED, EspSoftwareSerial::SWSERIAL_8N1, -1, IR_LED_PIN, true);
 
-  // Syslog setup
-  syslog.server(SYSLOG_SERVER, SYSLOG_PORT);
+  netConfig.load();
+  const NetConfig::Values &net = netConfig.active();
+
+  // Syslog setup (the library resolves the name per packet: moved aliases are followed)
+  if (net.syslogHost[0]) {
+    syslog.server(net.syslogHost, net.syslogPort);
+  }
   syslog.deviceHostname(HOSTNAME);
   syslog.appName("Joba1");
   syslog.defaultPriority(LOG_KERN);
@@ -1490,7 +1664,7 @@ void setup() {
   snprintf(msg, sizeof(msg), "%s Version %s, WLAN IP is %s", PROGNAME, VERSION,
            WiFi.localIP().toString().c_str());
   Serial.printf(msg);
-  syslog.logf(LOG_NOTICE, msg);
+  slogf(LOG_NOTICE, msg);
 
   // Boot post-mortem: report ESP reset reason, our recorded restart reason (if
   // any), and heap. Sent only after WiFi is up so syslog UDP actually delivers.
@@ -1516,7 +1690,7 @@ void setup() {
     int      rssi      = WiFi.RSSI();
 
     if (info && info->reason == REASON_EXCEPTION_RST) {
-      syslog.logf(LOG_ERR,
+      slogf(LOG_ERR,
         "Boot #%u: reset=%s prev=%s exccause=%u epc1=0x%08x epc2=0x%08x "
         "epc3=0x%08x excvaddr=0x%08x depc=0x%08x heap=%u maxblk=%u frag=%u%% "
         "rssi=%d rtc=%d",
@@ -1526,7 +1700,7 @@ void setup() {
         info->excvaddr, info->depc,
         free_heap, max_block, frag_pct, rssi, rtc_valid);
     } else {
-      syslog.logf(LOG_NOTICE,
+      slogf(LOG_NOTICE,
         "Boot #%u: reset=%s prev=%s heap=%u maxblk=%u frag=%u%% rssi=%d rtc=%d",
         boot_info.boot_count, ESP.getResetReason().c_str(),
         restart_reason_name(prev_reason),
@@ -1534,15 +1708,24 @@ void setup() {
     }
   }
 
+  slogf(LOG_NOTICE, "Netconfig (%s): syslog=%s:%u influx=%s:%u mqtt=%s:%u ntp=%s wled=%s",
+        netConfig.fromFlash() ? "flash" : "defaults", net.syslogHost, net.syslogPort,
+        net.influxHost, net.influxPort, net.mqttHost, net.mqttPort, net.ntp, net.wledHost);
+
+  ntp.setPoolServerName(net.ntp);
   ntp.begin();
 
   MDNS.begin(HOSTNAME);
 
-  esp_updater.setup(&web_server);
+  if (ADMIN_PASSWORD[0]) {
+    esp_updater.setup(&web_server, "/update", admin_user, ADMIN_PASSWORD);
+  } else {
+    esp_updater.setup(&web_server);
+  }
   setup_webserver();
 
 #ifdef DTU_TOPIC
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setServer(netConfig.active().mqttHost, netConfig.active().mqttPort);   // resolved per connect
   mqtt.setCallback(mqtt_callback);
 #endif
 
@@ -1571,7 +1754,7 @@ bool check_ntptime() {
     have_time = true;
     time_t now = time(NULL);
     strftime(start_time, sizeof(start_time), "%FT%T%Z", localtime(&now));
-    syslog.logf(LOG_NOTICE, "Booted at %s", start_time);
+    slogf(LOG_NOTICE, "Booted at %s", start_time);
   }
   return have_time;
 }
@@ -1893,7 +2076,7 @@ void sml_data( char *data, size_t len ) {
     // look impossible — independent of the delta-based is_power_valid below.
     if( !is_sane_itron(&itron, last_uptime) ) {
       stat_insane++;
-      syslog.logf(LOG_WARNING, "Insane SML frame dropped: %s", itronString(&itron));
+      slogf(LOG_WARNING, "Insane SML frame dropped: %s", itronString(&itron));
       itron.valid = 0;
     }
     // Validate readings are within configured power limits
@@ -1907,11 +2090,11 @@ void sml_data( char *data, size_t len ) {
         stat_backwards++;
         if( backwards_count == 1 ) stat_backwards_runs++;  // new run started
         if( backwards_count > stat_max_bw_run ) stat_max_bw_run = backwards_count;
-        syslog.logf(LOG_NOTICE,
+        slogf(LOG_NOTICE,
           "Backwards #%u: A+=%llu (was %llu) A-=%llu (was %llu)",
           backwards_count, itron.aPlus, last_aPlus, itron.aMinus, last_aMinus);
         if( backwards_count >= 5 ) {
-          syslog.logf(LOG_WARNING,
+          slogf(LOG_WARNING,
             "Meter reset confirmed after %u backwards readings, new baseline A+=%llu A-=%llu",
             backwards_count, itron.aPlus, itron.aMinus);
           last_uptime = itron.uptime;
@@ -1929,7 +2112,7 @@ void sml_data( char *data, size_t len ) {
           bool valid = true;
           if( !is_power_valid(itron.aPlus, last_aPlus, delta_time_s, true) ) {
             uint64_t delta = itron.aPlus - last_aPlus;
-            syslog.logf(LOG_WARNING,
+            slogf(LOG_WARNING,
               "Rejected: A+ delta=%llu/10 Wh in %u s = %.2f kW, limit=%u kW",
               delta, delta_time_s, delta * 0.36 / delta_time_s, USAGE_KW_MAX);
             stat_power++;
@@ -1937,7 +2120,7 @@ void sml_data( char *data, size_t len ) {
           }
           if( !is_power_valid(itron.aMinus, last_aMinus, delta_time_s, false) ) {
             uint64_t delta = itron.aMinus - last_aMinus;
-            syslog.logf(LOG_WARNING,
+            slogf(LOG_WARNING,
               "Rejected: A- delta=%llu/10 Wh in %u s = %.2f kW, limit=%u kW",
               delta, delta_time_s, delta * 0.36 / delta_time_s, PROD_KW_MAX);
             stat_power++;
@@ -1958,7 +2141,7 @@ void sml_data( char *data, size_t len ) {
       if( !locked_serial_set ) {
         memcpy(locked_serial, itron.serial, sizeof(locked_serial));
         locked_serial_set = true;
-        syslog.logf(LOG_NOTICE, "Locked meter serial = %s",
+        slogf(LOG_NOTICE, "Locked meter serial = %s",
                     to_hex(locked_serial, sizeof(locked_serial), '-'));
       }
       last_uptime = itron.uptime;
@@ -1982,7 +2165,7 @@ void sml_data( char *data, size_t len ) {
   count++;
   if( count > max_count ) {
     count = 0;
-    syslog.logf(LOG_NOTICE,
+    slogf(LOG_NOTICE,
       "Stats: %u readings, %u accepted, %u backwards (%u runs, max %u in a row), %u power-rejected, %u insane, crc=%u/%u ovf=%u, heap=%u frag=%u%% rssi=%d",
       stat_total, stat_accepted, stat_backwards, stat_backwards_runs, stat_max_bw_run, stat_power,
       stat_insane, sml_crc_ok, sml_crc_bad, sml_overflow,
@@ -1992,15 +2175,15 @@ void sml_data( char *data, size_t len ) {
     if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
       post_data();  // InfluxDB stays on the once-per-minute cadence
       if( recv_detailed ) {
-        syslog.logf(LOG_NOTICE, "Itron %s", itronString(&itron));
+        slogf(LOG_NOTICE, "Itron %s", itronString(&itron));
       }
       else {
-        syslog.logf(LOG_WARNING, "Itron %s", itronString(&itron));
+        slogf(LOG_WARNING, "Itron %s", itronString(&itron));
       }
     }
     else {
-      syslog.logf(LOG_NOTICE, "Sml[%u]=%s", len, to_hex(data, len, ','));
-      syslog.logf(LOG_NOTICE, "Itron invalid: %s", itronString(&itron));
+      slogf(LOG_NOTICE, "Sml[%u]=%s", len, to_hex(data, len, ','));
+      slogf(LOG_NOTICE, "Itron invalid: %s", itronString(&itron));
     }
   }
 
@@ -2146,7 +2329,12 @@ void loop() {
   static uint32_t updateDelay = 0;
   static bool smlRead = false;
 
-  ntp.update();
+  if (ntp.update() && ntp.isTimeSet()) {
+    ntp_last_ok_ms = millis();
+  }
+  if (should_reboot && (int32_t)(millis() - reboot_at) >= 0) {
+    ESP.restart();
+  }
   if (check_ntptime()) {
     breathe();
   }

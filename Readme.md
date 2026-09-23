@@ -277,3 +277,24 @@ Example message from my itron electricity meter
 * https://www.edi-energy.de/index.php?id=38&tx_bdew_bdew%5Buid%5D=1158&tx_bdew_bdew%5Baction%5D=download&tx_bdew_bdew%5Bcontroller%5D=Dokument&cHash=4ee767287a68d3f0fbbc3caf2974d97f
 * https://www.itron.com/-/media/feature/products/documents/brochure/openway_kl.pdf
 * https://www.devolo.ch/fileadmin/Web-Content/DE/products/sg/3hz-basiszaehler/documents/de/Handbuch_devolo_3.HZ_Basiszaehler_D3B60_D3B100_0419_Online_DE.pdf
+
+## Server hosts at runtime and admin login (since 11.7)
+
+`syslog_server`, `influx_server`, `mqtt_broker`, `ntp_server` and `wled_host` in `platformio.ini`
+are only defaults, now the service aliases `syslog`, `influx` and `mqtt`. A change needs no
+rebuild: it is validated, stored in the EEPROM sector (magic + CRC; the boot info lives in RTC
+memory) and active after the reboot that follows 1 s later (`reboot=0` suppresses it).
+
+    curl -u admin:<pw> -X POST http://power3/api/netconfig -d mqttHost=mqtt -d influxHost=influx
+    curl -u admin:<pw> -X POST http://power3/api/netconfig -d defaults=1
+    curl http://power3/api/netconfig     # active values, source, defaults
+    curl http://power3/api/netstatus     # firmware, WiFi, syslog/InfluxDB/MQTT/NTP/WLED with last result
+
+Fields: `syslogHost`, `syslogPort`, `influxHost`, `influxPort`, `mqttHost`, `mqttPort`, `ntp`,
+`wledHost`. Host names only (letters, digits, `-`, `.`; empty = off), ports 1..65535; a bad value
+gives `400 {"error":"invalid value","field":...}` and nothing is stored.
+
+`/update`, `/reset` and `POST /api/netconfig` need the user `admin` and the password from
+`secrets.ini` (untracked, mode 600; see `secrets.ini.template`). `pio_secrets.py` compiles it in,
+and `upload_script.py` uses it for OTA. The WLED tuning pages stay open. Without `secrets.ini`
+there is no lock (`"adminLock": false`).
