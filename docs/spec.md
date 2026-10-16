@@ -145,6 +145,31 @@ Recorder history, long-term statistics and the energy dashboard hang on them.
    copied to the new ids by `tools/influx_migrate_v12.py ha` and verified point by point.
    The old series are dumped and then dropped.
 
+### HA statistics repair (pre-existing damage)
+
+The HA long-term statistics of both counters had been broken since the v11.0–v11.2
+bit errors (2026-05-24 to 2026-06-18). Corrupt states such as 9.2e17 Wh put jumps of
+up to 1e18 into `sum`. At that magnitude a float64 resolves only ~1 kWh, so the energy
+dashboard showed no grid import or export from June on.
+`tools/ha_fix_statistics_v12.py` (run on 2026-10-16 after a DB backup,
+`home-assistant_v2.db.bak-v12-stats-20261016-154932` on the QNAP) does the following:
+
+* **Rebuild.** Hourly sums are rebuilt from the hourly states, with absurd, backwards
+  or too fast rises skipped. The allowance is counted from the last real rise: on
+  2026-06-06 and 06-17 HA's state froze all day and caught up in the evening.
+* **Write-back.** `recorder/adjust_sum_statistics` removes the offset from the hourly
+  and 5-minute tables, and `recorder/import_statistics` writes the rebuilt hourly rows.
+* **Async recorder.** The recorder applies both calls asynchronously from its queue,
+  so the tool polls until each step is visible. An earlier run with fixed sleeps
+  raced, and its first import overwrote the original spike-hour states. The rebuild
+  therefore takes its states from the stats snapshot taken before the rename
+  (`--snapshot`).
+
+Result: for all 144 days since 2026-05-24 the daily HA import and export match the
+meter counters in InfluxDB within 100 Wh. The only exception is a deliberate −173 Wh
+on 2026-05-27, the rounding remainder of the 5-minute base. The 5-minute values of
+the 10 days before the repair stay coarse until HA purges them.
+
 ## Consumers updated at the cutover
 
 | Consumer | Change |

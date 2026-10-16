@@ -32,8 +32,10 @@ same data.
 | Panels continuous across the cutover | new panel query, last 3 h | no gap except the ~1.5 min reboot |
 | Firmware power vs counter derivative | `mean(p_out)` vs `derivative(a_minus)` per minute | agree (one-bucket lag of the derivative panel) |
 | HA entities adopted with history | registry: `sensor.energie_bezug` has unique_id `power3_a_plus` and the power3 device | ok |
-| HA long-term statistics unchanged by the rename | `tools/ha_migrate_v12.py stats` before/after, diff | see the session notes |
-| HA InfluxDB series copied | `tools/influx_migrate_v12.py ha-verify` | see the session notes |
+| HA long-term statistics unchanged by the rename | `tools/ha_migrate_v12.py stats` before/after, diff | 3467 + 3456 hours, 0 differing |
+| HA state history moved | REST history for the new id, 9 days | 2289 states under the new id, none under the old one |
+| HA InfluxDB series copied | `tools/influx_migrate_v12.py ha-verify` | 915,272 + 2,394,907 points, 0 missing (old series dumped to `~/var/backup/electricitymeter-v12/`, then dropped) |
+| HA statistics repair vs. meter data | daily HA sum differences vs. InfluxDB `last(a_plus/a_minus)` at local midnight | 144/144 days within 100 Wh (except the deliberate −173 Wh on 2026-05-27) |
 
 ## Live checks after a firmware update
 
