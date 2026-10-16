@@ -22,6 +22,7 @@ dark-themed nav bar:
 * `/wled` – WLED settings: runtime-configurable color thresholds, hysteresis delays, colors,
   and a toggle for WLED live-receive mode (only shown when `WLED_LEDS` is defined)
 * `/json` – stable JSON API (unchanged across versions)
+* `/api/stats`, `/api/netconfig`, `/api/netstatus` – live values, runtime hosts, resource status
 * `/sml` – last raw SML record (binary download, unchanged)
 * `/update` – OTA firmware upload
 * `POST /reset` – reboot the device
@@ -66,19 +67,32 @@ Every message below is at `LOG_NOTICE` or higher and appears under the device ho
 - `I>0` — sanity gates dropped a frame. Look at the preceding `Insane SML frame dropped` line for which field was out of bounds.
 - Repeated `Boot #N` lines minutes apart point to firmware crashes; check the `reset=` field — `Exception` and `Hardware Watchdog` are bugs, `External System` is a brownout / power glitch, `Software/System restart` after a `/reset` POST or a flash is expected.
 
-### InfluxDB Storage
+### InfluxDB Storage (since v12)
 
-Accepted readings are posted to InfluxDB 1.x on host `job4`, database `power`, measurement
-`energy`, tag `meter=<10-byte serial>`. Two integer fields are written:
+Every ~10 s (10 accepted frames) one point goes to InfluxDB 1.x (alias `influx`),
+database `power`, measurement `smartmeter`:
 
-| Field | Stores | Note |
-|-------|--------|------|
-| `watt` | A+ counter (consumption) in **Wh** | Despite the name, **not** instantaneous watts. Computed as `(aPlus + 5) / 10` from the raw 1/10 Wh meter counter. |
-| `watt_out` | A- counter (backfeed) in **Wh** | Same misnomer. |
+```
+smartmeter,device=power3,devicetype=power,meter=<serial> a_plus=28506400.3,a_minus=9573175.0,p_in=0,p_out=5040,detailed=true
+```
 
-Both names are historical and kept for Grafana/InfluxDB compatibility. To get instantaneous
-power in watts from these cumulative counters, apply a derivative, e.g.
-`SELECT derivative(mean("watt"), 1s) * 3600 FROM energy WHERE time > now() - 1h GROUP BY time(1m)`.
+| Field | Stores |
+|-------|--------|
+| `a_plus` / `a_minus` | cumulative import / export counter in **Wh** (0.1 Wh resolution) |
+| `p_in` / `p_out` | live power in **W** (see *Live power* in [docs/spec.md](docs/spec.md)) |
+| `detailed` | meter delivers 0.1 Wh readings (false = kWh only, PIN needed) |
+
+Up to v11 the gateway wrote `energy` with `watt`/`watt_out`, which despite the names held
+rounded Wh. That history has been copied into `smartmeter` (`watt`→`a_plus`,
+`watt_out`→`a_minus`; `tools/influx_migrate_v12.py`); `energy` is kept as a read-only backup.
+
+### MQTT and Home Assistant (since v12)
+
+The gateway announces itself by MQTT discovery as device `power3` (model `power`) with
+the energy counters `sensor.power3_a_plus`/`a_minus`, live power `p_in`/`p_out`/`p_net`
+and the diagnostics meter serial, detailed readings and InfluxDB status. Topics,
+cadence and the migration from the old YAML sensors are in [docs/spec.md](docs/spec.md).
+The old topics `power3/Wh_In`/`Wh_Out` are gone.
 
 ### WLED Visual Feedback
 Enabled if `WLED_LEDS` is defined. Provides color-coded visual feedback via WLED using UDP protocol (DRGB).

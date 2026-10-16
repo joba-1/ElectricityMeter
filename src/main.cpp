@@ -156,6 +156,27 @@ itron_3hz_t itron = {0};
 time_t recv_time = 0;
 bool recv_detailed = true;
 
+// Live power per direction from the accepted frames (see PowerEstimator.h)
+#include <PowerEstimator.h>
+static PowerEstimator est_in;    // A+, consumption
+static PowerEstimator est_out;   // A-, backfeed
+static uint32_t p_in_w()  { return (est_in.power_dW()  + 5) / 10; }
+static uint32_t p_out_w() { return (est_out.power_dW() + 5) / 10; }
+
+// Last meter readings from a validated SML message. Used for display so a
+// partial or rejected message that lands in the global itron doesn't make
+// the live values flicker to 0.
+static uint64_t latest_aPlus  = 0;
+static uint64_t latest_aMinus = 0;
+static bool     meter_seen    = false;
+
+// Meter serial of the first frame that passed every gate (see is_sane_itron)
+static char locked_serial[10] = {0};
+static bool locked_serial_set = false;
+
+// Write to InfluxDB every this many accepted frames (~1 frame/s)
+static const uint32_t influx_every_frames = 10;
+
 // Reset every Stats interval. CRC counters reported but not yet used to reject.
 static uint32_t sml_crc_ok = 0, sml_crc_bad = 0, sml_overflow = 0;
 
@@ -181,14 +202,20 @@ char *to_hex( char *buf, size_t len, char sep ) {
   return hex;
 }
 
-// Post data to InfluxDB
+// Post the current reading to InfluxDB. Since v12 measurement `smartmeter`:
+// counters a_plus/a_minus in Wh with the meter's 0.1 Wh resolution (v11 wrote
+// rounded Wh as watt/watt_out to `energy`), live power p_in/p_out in W.
 void post_data() {
   static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
 
-  const char fmt[] = "energy,meter=%s watt=%llu,watt_out=%llu\n";
-  char msg[sizeof(fmt) + 30 + 2 * 10];
+  char msg[256];
   char *serial = to_hex(itron.serial, sizeof(itron.serial), '-');
-  snprintf(msg, sizeof(msg), fmt, serial, (itron.aPlus+5)/10, (itron.aMinus+5)/10);
+  snprintf(msg, sizeof(msg),
+    "smartmeter,device=" HOSTNAME ",devicetype=" PROGNAME ",meter=%s "
+    "a_plus=%llu.%u,a_minus=%llu.%u,p_in=%u,p_out=%u,detailed=%s\n",
+    serial, itron.aPlus / 10, (unsigned)(itron.aPlus % 10),
+    itron.aMinus / 10, (unsigned)(itron.aMinus % 10),
+    (unsigned)p_in_w(), (unsigned)p_out_w(), itron.detailed ? "true" : "false");
 
   const NetConfig::Values &net = netConfig.active();
   if (!net.influxHost[0]) return;   // InfluxDB disabled
@@ -285,11 +312,14 @@ static bool wled_post_live_en(bool enable) {
 }
 #endif
 
-#ifdef DTU_TOPIC
+// MQTT: Home Assistant discovery + states (always), OpenDTU inverter cap (DTU_TOPIC)
 #include <PubSubClient.h>
 
 WiFiClient wifiMqtt;
 PubSubClient mqtt(wifiMqtt);
+time_t last_mqtt_ok = 0;  // wall time of last confirmed broker connection
+
+#ifdef DTU_TOPIC
 const char topic_name[] =      DTU_TOPIC "/" INVERTER_SERIAL "/name";
 const char topic_limit[] =     DTU_TOPIC "/" INVERTER_SERIAL "/status/limit_absolute";
 const char topic_reachable[] = DTU_TOPIC "/" INVERTER_SERIAL "/status/reachable";
@@ -298,7 +328,6 @@ char inverter[80] = "?";
 uint16_t curr_limit = UINT16_MAX;
 bool reachable = false;
 bool dynamic = false;
-time_t last_mqtt_ok = 0;  // wall time of last confirmed broker connection
 
 /*
 Send MQTT request to change power limit if it changed
@@ -380,31 +409,149 @@ void check_limit() {
   }
 }
 
-// send current power consumption or production to mqtt
+#endif  // DTU_TOPIC
+
+// ---- Home Assistant via MQTT discovery ----
+// The device is this gateway: name = hostname, model = firmware name. States
+// hang under HOSTNAME/ (a_plus, a_minus, p_in, p_out, p_net, serial, detailed,
+// influx, influx_status); availability is the existing HOSTNAME/LWT.
+// Counters and status are retained so HA has them right after its own restart;
+// live power is not (a stale power value would be wrong, not just old).
+
+static bool mqtt_republish = true;   // all states once after (re)connect or HA birth
+
+// Live power: publish when it moved by >= max(10 W, 2 %), else at least every 60 s.
+static const uint32_t power_min_delta_w  = 10;
+static const uint32_t power_heartbeat_ms = 60 * 1000;
+// Counters: on change, at most this often (HA energy statistics are hourly)
+static const uint32_t counter_interval_ms = 10 * 1000;
+
+static bool mqtt_pub(const char *key, const char *value, bool retained) {
+  char topic[40];
+  snprintf(topic, sizeof(topic), HOSTNAME "/%s", key);
+  bool ok = mqtt.publish(topic, value, retained);
+  if (ok) mqtt_last_publish_ms = millis();
+  return ok;
+}
+
+// One discovery config. `extra` carries the component specific keys, each
+// followed by a comma. Full key names where an abbreviation is not certain.
+static bool publish_discovery(const char *component, const char *key,
+                              const char *name, const char *extra) {
+  char topic[80];
+  static char payload[640];
+  snprintf(topic, sizeof(topic), "homeassistant/%s/" HOSTNAME "/%s/config", component, key);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"%s\",\"uniq_id\":\"" HOSTNAME "_%s\","
+    "\"default_entity_id\":\"%s." HOSTNAME "_%s\","
+    "\"stat_t\":\"" HOSTNAME "/%s\",\"avty_t\":\"" HOSTNAME "/LWT\","
+    "\"pl_avail\":\"Online\",\"pl_not_avail\":\"Offline\",%s"
+    "\"dev\":{\"ids\":[\"" HOSTNAME "\"],\"name\":\"" HOSTNAME "\",\"mdl\":\"" PROGNAME "\","
+    "\"sw\":\"" VERSION "\",\"mf\":\"joba-1\",\"cu\":\"http://" HOSTNAME "/\"}}",
+    name, key, component, key, key, extra);
+  return mqtt.publish(topic, payload, true);
+}
+
+static bool publish_all_discovery() {
+  static const char energy[] =
+    "\"dev_cla\":\"energy\",\"stat_cla\":\"total_increasing\",\"unit_of_meas\":\"Wh\",\"sug_dsp_prc\":0,";
+  static const char power[] =
+    "\"dev_cla\":\"power\",\"stat_cla\":\"measurement\",\"unit_of_meas\":\"W\",";
+  static const char diag[] = "\"ent_cat\":\"diagnostic\",";
+  return publish_discovery("sensor", "a_plus", "Bezug A+", energy)
+      && publish_discovery("sensor", "a_minus", "Einspeisung A-", energy)
+      && publish_discovery("sensor", "p_in", "Leistung Bezug", power)
+      && publish_discovery("sensor", "p_out", "Leistung Einspeisung", power)
+      && publish_discovery("sensor", "p_net", "Leistung Netz", power)
+      && publish_discovery("sensor", "serial", "Zählernummer",
+           "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:counter\",")
+      && publish_discovery("binary_sensor", "detailed", "Detaillierte Werte",
+           "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:magnify-plus\",")
+      && publish_discovery("binary_sensor", "influx", "InfluxDB",
+           "\"ent_cat\":\"diagnostic\",\"dev_cla\":\"connectivity\",")
+      && publish_discovery("sensor", "influx_status", "InfluxDB HTTP-Status", diag);
+}
+
+// States from the last accepted frame. Called per accepted frame and after
+// each InfluxDB post; self-dedupes so the broker sees changes only.
 void publish_data() {
-  static uint64_t lastAPlusW = 0;
-  static uint64_t lastAMinusW = 0;
+  static uint64_t last_a_plus = UINT64_MAX, last_a_minus = UINT64_MAX;
+  static uint32_t counter_ms = 0;
+  static uint32_t last_p_in = UINT32_MAX, last_p_out = UINT32_MAX, power_ms = 0;
+  static char last_serial[32] = "";
+  static int8_t last_detailed = -1, last_influx_ok = -1;
+  static int last_influx_status = INT_MIN;
 
-  uint64_t aPlusW = (itron.aPlus + 5) / 10;
-  uint64_t aMinusW = (itron.aMinus + 5) / 10;
+  if (!mqtt.connected() || !meter_seen) return;
+  uint32_t now = millis();
+  bool all = mqtt_republish;
+  mqtt_republish = false;
+  char buf[32];
 
-  if( aPlusW != lastAPlusW ) {
-    char wh[20];
-    snprintf(wh, sizeof(wh), "%llu", aPlusW);
-    if (mqtt.publish(HOSTNAME "/Wh_In", wh)) mqtt_last_publish_ms = millis();
-    lastAPlusW = aPlusW;
+  if (all || ((latest_aPlus != last_a_plus || latest_aMinus != last_a_minus)
+              && now - counter_ms >= counter_interval_ms)) {
+    snprintf(buf, sizeof(buf), "%llu.%u", latest_aPlus / 10, (unsigned)(latest_aPlus % 10));
+    mqtt_pub("a_plus", buf, true);
+    snprintf(buf, sizeof(buf), "%llu.%u", latest_aMinus / 10, (unsigned)(latest_aMinus % 10));
+    mqtt_pub("a_minus", buf, true);
+    last_a_plus = latest_aPlus;
+    last_a_minus = latest_aMinus;
+    counter_ms = now;
   }
 
-  if( aMinusW != lastAMinusW ) {
-    char wh[20];
-    snprintf(wh, sizeof(wh), "%llu", aMinusW);
-    if (mqtt.publish(HOSTNAME "/Wh_Out", wh)) mqtt_last_publish_ms = millis();
-    lastAMinusW = aMinusW;
+  uint32_t pi = p_in_w(), po = p_out_w();
+  auto moved = [](uint32_t v, uint32_t last) {
+    if (last == UINT32_MAX) return true;
+    uint32_t d = v > last ? v - last : last - v;
+    return d >= power_min_delta_w && d * 50 >= last;   // >= 10 W and >= 2 %
+  };
+  if (all || moved(pi, last_p_in) || moved(po, last_p_out) || now - power_ms >= power_heartbeat_ms) {
+    snprintf(buf, sizeof(buf), "%u", (unsigned)pi);
+    mqtt_pub("p_in", buf, false);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)po);
+    mqtt_pub("p_out", buf, false);
+    snprintf(buf, sizeof(buf), "%ld", (long)pi - (long)po);
+    mqtt_pub("p_net", buf, false);
+    last_p_in = pi;
+    last_p_out = po;
+    power_ms = now;
+  }
+
+  const char *serial = to_hex(locked_serial, sizeof(locked_serial), '-');
+  if (locked_serial_set && (all || strcmp(serial, last_serial) != 0)) {
+    if (mqtt_pub("serial", serial, true)) {
+      strncpy(last_serial, serial, sizeof(last_serial) - 1);
+    }
+  }
+  if (all || last_detailed != (int8_t)recv_detailed) {
+    mqtt_pub("detailed", recv_detailed ? "ON" : "OFF", true);
+    last_detailed = recv_detailed;
+  }
+  if (influx_status != 0) {   // 0 = nothing posted yet
+    bool ok = influx_status >= 200 && influx_status <= 299;
+    if (all || last_influx_ok != (int8_t)ok) {
+      mqtt_pub("influx", ok ? "ON" : "OFF", true);
+      last_influx_ok = ok;
+    }
+    if (all || last_influx_status != influx_status) {
+      snprintf(buf, sizeof(buf), "%d", influx_status);
+      mqtt_pub("influx_status", buf, true);
+      last_influx_status = influx_status;
+    }
   }
 }
 
-// Called on incoming mqtt limit_absolute messages
+// Incoming: HA birth message (re-announce) and the OpenDTU inverter status
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, "homeassistant/status") == 0) {
+    if (length == 6 && memcmp(payload, "online", 6) == 0) {
+      publish_all_discovery();
+      mqtt_republish = true;
+      slog(LOG_NOTICE, "HA online: discovery re-sent");
+    }
+    return;
+  }
+#ifdef DTU_TOPIC
   if (strcmp(topic_reachable, topic) == 0) {
     if( length > 0 ) {
       bool flag = payload[0] != '0';
@@ -448,7 +595,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         dynamic = flag;
     }
   }
-  else {
+  else
+#endif
+  {
     slogf(LOG_ERR, "Unknown topic '%s'", topic);
   }
 }
@@ -458,6 +607,7 @@ void handle_mqtt() {
   static uint32_t prev = -interval;      // first connect attempt without delay
   static char msg[128];
 
+  if (!netConfig.active().mqttHost[0]) return;   // MQTT disabled
   if (mqtt.connected()) {
     last_mqtt_ok = time(NULL);
     mqtt.loop();
@@ -470,10 +620,16 @@ void handle_mqtt() {
       if (mqtt.connect(HOSTNAME, HOSTNAME "/LWT", 0, true, "Offline")
       && mqtt.publish(HOSTNAME "/LWT", "Online", true)
       && mqtt.publish(HOSTNAME "/Version", VERSION, true)
+      && publish_all_discovery()
+      && mqtt.subscribe("homeassistant/status")
+#ifdef DTU_TOPIC
       && mqtt.subscribe(topic_reachable)
       && mqtt.subscribe(topic_limit)
       && mqtt.subscribe(topic_dynamic)
-      && mqtt.subscribe(topic_name)) {
+      && mqtt.subscribe(topic_name)
+#endif
+      ) {
+        mqtt_republish = true;
         mqtt_last_connect_ms = millis();
         mqtt_last_rc = mqtt.state();
         snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%u using topic %s",
@@ -492,7 +648,6 @@ void handle_mqtt() {
     }
   }
 }
-#endif
 
 // Rolling-window consumption tracking.
 //
@@ -539,14 +694,15 @@ static const uint32_t edges_refresh_ms = 60 * 1000;
 // edge. 'p' points at the start of the block's header line; returns the pointer
 // advanced past the consumed data line, or the next block. A block looks like:
 //   name,tags,time,first,first_1\n
-//   energy,,<time>,<watt>,<watt_out>\n
-// Stored values are integer Wh (from post_data) so we scale back to 1/10 Wh.
+//   smartmeter,,<time>,<a_plus>,<a_minus>\n
+// Stored values are Wh floats (0.1 Wh resolution since v12, whole Wh in the
+// history migrated from v11), so parse as double and scale back to 1/10 Wh.
 static const char *parse_edge_block( const char *p, period_t *out ) {
   // Skip the header line.
   const char *nl = strchr(p, '\n');
   if( !nl ) return p + strlen(p);
   const char *line = nl + 1;
-  // Skip 3 commas to reach the 'first' (watt) column: energy,,time,first,first_1
+  // Skip 3 commas to reach the 'first' (a_plus) column: smartmeter,,time,first,first_1
   int comma = 0;
   const char *c = line;
   while( *c && *c != '\n' && comma < 3 ) {
@@ -555,12 +711,15 @@ static const char *parse_edge_block( const char *p, period_t *out ) {
   }
   if( comma == 3 ) {
     char *end;
-    unsigned long long ap = strtoull(c, &end, 10);
+    double ap = strtod(c, &end);
     if( end > c && *end == ',' ) {
-      unsigned long long am = strtoull(end + 1, &end, 10);
-      out->aPlus  = (uint64_t)ap * 10;
-      out->aMinus = (uint64_t)am * 10;
-      out->valid  = true;
+      const char *am_start = end + 1;
+      double am = strtod(am_start, &end);
+      if( end > am_start && ap >= 0 && am >= 0 ) {
+        out->aPlus  = (uint64_t)(ap * 10 + 0.5);
+        out->aMinus = (uint64_t)(am * 10 + 0.5);
+        out->valid  = true;
+      }
     }
   }
   // Advance to the start of the next block (line after this data line).
@@ -571,17 +730,23 @@ static const char *parse_edge_block( const char *p, period_t *out ) {
 // Fetch all 8 historical window edges from InfluxDB in a single batched,
 // multi-statement query. Using InfluxDB's server-side now() means all windows
 // share one consistent reference instant and we need no accurate local clock.
-// CSV response for 8 windows is ~525 B; we read into a fixed buffer to avoid
+// CSV response for 8 windows is ~600 B; we read into a fixed buffer to avoid
 // String churn.
 static bool refresh_rolling_edges() {
   // Build the multi-statement query: one "SELECT first(...) WHERE time>=now()-<off>"
-  // per edge, separated by ';'. URL-encode ','->%2C ';'->%3B '>='->%3E%3D ' '->'+'.
-  static char url[768];
+  // per edge, separated by ';'. URL-encode ','->%2C ';'->%3B '>='->%3E%3D '='->%3D
+  // quote->%27 ' '->'+'. 8 statements are ~900 B (power3).
+  static char url[1024];
   size_t pos = snprintf(url, sizeof(url), "/query?db=" INFLUX_DB "&epoch=s&q=");
   for( int i = 0; i < EDGE_COUNT; i++ ) {
     pos += snprintf(url + pos, sizeof(url) - pos,
-      "%sSELECT+first(watt)%%2Cfirst(watt_out)+FROM+energy+WHERE+time+%%3E%%3D+now()-%s",
+      "%sSELECT+first(a_plus)%%2Cfirst(a_minus)+FROM+smartmeter"
+      "+WHERE+device%%3D%%27" HOSTNAME "%%27+AND+time+%%3E%%3D+now()-%s",
       i ? "%3B" : "", edge_offset[i]);
+  }
+  if( pos >= sizeof(url) ) {   // a truncated query would silently lose the oldest windows
+    slogf(LOG_ERR, "Rolling-edge query too long: %u B", (unsigned)pos);
+    return false;
   }
 
   if (!netConfig.active().influxHost[0]) return false;   // InfluxDB disabled
@@ -777,104 +942,24 @@ void emit_period_row( const char *label, const char *id, const period_t *cur, co
   web_server.sendContent(web_buf);
 }
 
-// Adaptive live power tracker.
-//
-// The anchor window grows until MIN_TICKS energy increments have accumulated,
-// then resets. At high load ticks arrive fast → short window → quick response
-// to switching large loads on/off. At low load ticks are rare → the window
-// spans multiple tick intervals → smooth average instead of spike-then-fade.
-// The displayed value is updated only on a new tick and held between ticks,
-// so the display is stable rather than fading toward zero.
-struct power_state_t {
-  uint32_t uptime;
-  uint64_t aPlus;
-  uint64_t aMinus;
-  uint64_t aPlusW;   // 1/10 W
-  uint64_t aMinusW;  // 1/10 W
-};
-
-static power_state_t live_power = {0, 0, 0, 0, 0};
-
-// Require this many counter increments before resetting the integration anchor.
-// High load → many ticks → fast resets → responsive. Low load → few ticks →
-// anchor stays long → smooth average. Max window caps the stale-display risk.
-static const uint32_t POWER_MIN_TICKS = 3;
-static const uint32_t POWER_MAX_WIN_S = 300;  // 5 min safety cap
-
-// Last meter readings from a validated SML message. Used for display so a
-// partial or rejected message that lands in the global itron doesn't make
-// the live values flicker to 0.
-static uint64_t latest_aPlus  = 0;
-static uint64_t latest_aMinus = 0;
-static bool     meter_seen    = false;
-
+// Feed the accepted frame to the live power estimators. A frame that goes
+// backwards (caught earlier by the sanity gates, so this is defence in depth)
+// or an impossible result restarts both.
 void update_power() {
   if( itron.valid != 0x3f ) return;
-
-  // Static state for tick counting; reinitialised when live_power is zeroed
-  // (e.g. after a meter reset detected in sml_data).
-  static uint64_t prev_aPlus   = 0;
-  static uint64_t prev_aMinus  = 0;
-  static uint32_t plus_ticks   = 0;
-  static uint32_t minus_ticks  = 0;
-
-  if( live_power.uptime == 0 ) {
-    live_power.uptime = itron.uptime;
-    live_power.aPlus  = itron.aPlus;
-    live_power.aMinus = itron.aMinus;
-    prev_aPlus   = itron.aPlus;
-    prev_aMinus  = itron.aMinus;
-    plus_ticks   = 0;
-    minus_ticks  = 0;
+  if( !est_in.update(itron.uptime, itron.aPlus) || !est_out.update(itron.uptime, itron.aMinus) ) {
+    slogf(LOG_WARNING, "Live power reset: frame went backwards (uptime=%u A+=%llu A-=%llu)",
+      itron.uptime, itron.aPlus, itron.aMinus);
+    est_in.reset();
+    est_out.reset();
     return;
   }
-  if( itron.aPlus < live_power.aPlus || itron.aMinus < live_power.aMinus ) {
-    // Anchor is ahead of current reading — reset so we re-init on the next call.
-    slogf(LOG_WARNING, "Live power anchor reset: A+=%llu<%llu or A-=%llu<%llu",
-      itron.aPlus, live_power.aPlus, itron.aMinus, live_power.aMinus);
-    live_power = power_state_t{};
-    return;
-  }
-
-  // Detect new energy increments since the previous reading.
-  bool new_plus  = itron.aPlus  > prev_aPlus;
-  bool new_minus = itron.aMinus > prev_aMinus;
-  prev_aPlus  = itron.aPlus;
-  prev_aMinus = itron.aMinus;
-  if( new_plus  ) plus_ticks++;
-  if( new_minus ) minus_ticks++;
-
-  uint64_t dPlus  = itron.aPlus  - live_power.aPlus;
-  uint64_t dMinus = itron.aMinus - live_power.aMinus;
-  uint32_t dt     = itron.uptime - live_power.uptime;
-
-  // Always update displayed power so it naturally decays toward 0 when
-  // consumption drops. Because the anchor only resets on ticks (below), dt
-  // at the first tick of a new window is always meaningful — no more spikes.
-  if( dt > 0 ) {
-    live_power.aPlusW  = dPlus  * 3600 / dt;
-    live_power.aMinusW = dMinus * 3600 / dt;
-    // Guard against impossible values (e.g. from dt being tiny due to uptime glitch).
-    uint64_t max_w = (uint64_t)max(USAGE_KW_MAX, PROD_KW_MAX) * 10000ULL;
-    if( live_power.aPlusW > max_w || live_power.aMinusW > max_w ) {
-      slogf(LOG_WARNING, "Live power out of range: A+W=%llu A-W=%llu (1/10W); resetting",
-        live_power.aPlusW, live_power.aMinusW);
-      live_power = power_state_t{};
-    }
-  }
-
-  // Advance anchor after MIN_TICKS (adapts to load) or at the safety cap.
-  // Resetting only on ticks ensures dt is never artificially small when the
-  // first tick of a new window arrives, eliminating the spike-then-fade artifact.
-  bool do_reset = (plus_ticks  >= POWER_MIN_TICKS)
-               || (minus_ticks >= POWER_MIN_TICKS)
-               || (dt >= POWER_MAX_WIN_S);
-  if( do_reset ) {
-    live_power.uptime = itron.uptime;
-    live_power.aPlus  = itron.aPlus;
-    live_power.aMinus = itron.aMinus;
-    plus_ticks  = 0;
-    minus_ticks = 0;
+  uint32_t max_dw = (uint32_t)max(USAGE_KW_MAX, PROD_KW_MAX) * 10000UL;
+  if( est_in.power_dW() > max_dw || est_out.power_dW() > max_dw ) {
+    slogf(LOG_WARNING, "Live power out of range: in=%u out=%u (1/10W); resetting",
+      est_in.power_dW(), est_out.power_dW());
+    est_in.reset();
+    est_out.reset();
   }
 }
 
@@ -937,11 +1022,11 @@ void send_wled() {
   time_t now_t = time(NULL);
   bool valid_time = (now_t > 1000000000UL);
 
-  // Power readings in W (live_power is in 1/10 W)
+  // Live power in W
   uint64_t aPlusW = 0, aMinusW = 0;
-  if( meter_seen && live_power.uptime != 0 ) {
-    aPlusW  = live_power.aPlusW  / 10;
-    aMinusW = live_power.aMinusW / 10;
+  if( meter_seen ) {
+    aPlusW  = p_in_w();
+    aMinusW = p_out_w();
   }
 
   // Each color: entry condition (above threshold) / exit condition (below threshold - hysteresis).
@@ -963,10 +1048,7 @@ void send_wled() {
   bool daytime = false;
   bool no_meter  = (recv_time == 0 || now_t - recv_time > 120);
   bool no_db     = (post_time > 0 && now_t - post_time > 1800);
-  bool no_broker = false;
-#ifdef DTU_TOPIC
-  no_broker = (last_mqtt_ok > 0 && now_t - last_mqtt_ok > 1800);
-#endif
+  bool no_broker = (last_mqtt_ok > 0 && now_t - last_mqtt_ok > 1800);
   bool any_error = no_meter || no_db || no_broker;
   if( valid_time ) {
     struct tm t;
@@ -1048,8 +1130,8 @@ void send_power_card() {
     "<div class=\"value\"><span id=\"am_w\">%.1f</span><span class=\"unit\">W</span></div>"
     "<div class=\"sub\"><span id=\"am_kwh\">%.4f</span> kWh</div></div>"
     "</div></div>",
-    live_power.aPlusW  / 10.0, latest_aPlus  / 10000.0,
-    live_power.aMinusW / 10.0, latest_aMinus / 10000.0);
+    est_in.power_dW()  / 10.0, latest_aPlus  / 10000.0,
+    est_out.power_dW() / 10.0, latest_aMinus / 10000.0);
   web_server.sendContent(web_buf);
 }
 
@@ -1308,7 +1390,7 @@ void setup_webserver() {
     size_t pos = 0;
     pos += snprintf(json + pos, sizeof(json) - pos,
       "{\"ap_w\":%.1f,\"am_w\":%.1f,\"ap_kwh\":%.4f,\"am_kwh\":%.4f",
-      live_power.aPlusW  / 10.0, live_power.aMinusW / 10.0,
+      est_in.power_dW() / 10.0, est_out.power_dW() / 10.0,
       latest_aPlus / 10000.0, latest_aMinus / 10000.0);
 
     period_t now_period = { latest_aPlus, latest_aMinus, meter_seen };
@@ -1621,6 +1703,9 @@ void setup() {
   digitalWrite(DB_LED_PIN, DB_LED_ON);
   analogWriteRange(PWMRANGE);
 
+  // An InfluxDB post can block ~100 ms (2 s on timeout) every 10 s; at 9600
+  // baud the default 256 B RX buffer would overflow and cost that frame.
+  Serial.setRxBufferSize(1024);
   Serial.begin(SERIAL_SPEED);
   Serial.println("\nStarting " PROGNAME " v" VERSION " " __DATE__ " " __TIME__);
 
@@ -1724,10 +1809,9 @@ void setup() {
   }
   setup_webserver();
 
-#ifdef DTU_TOPIC
   mqtt.setServer(netConfig.active().mqttHost, netConfig.active().mqttPort);   // resolved per connect
   mqtt.setCallback(mqtt_callback);
-#endif
+  mqtt.setBufferSize(768);   // discovery configs are ~550 B (default 256)
 
   // Test wled status info
   // itron.valid = 0x3f;
@@ -1797,8 +1881,6 @@ typedef enum { SML_NONE=0, SML_OPEN=0x0101, SML_LIST=0x0701, SML_CLOSE=0x0201 } 
 // not yet reject. is_power_valid below handles delta-based bounds (the
 // original rejection logic). These gates check absolute magnitudes, meter
 // identity, and uptime monotonicity — orthogonal to the delta checks.
-static char locked_serial[10] = {0};
-static bool locked_serial_set = false;
 static const uint64_t MAX_RAW_1_10WH = 1000000000000ull;  // 100 GWh (residential ≪ this)
 
 static bool is_sane_itron(const itron_3hz_t *it, uint32_t last_uptime) {
@@ -2061,6 +2143,7 @@ void sml_data( char *data, size_t len ) {
   static uint32_t stat_max_bw_run     = 0;  // longest backwards run (lumping)
   static uint32_t stat_power          = 0;
   static uint32_t stat_insane         = 0;
+  static uint32_t influx_frames       = 0;
 
   sml_len = min(len, (size_t)sizeof(sml_raw));
   memcpy(sml_raw, data, sml_len);
@@ -2100,7 +2183,8 @@ void sml_data( char *data, size_t len ) {
           last_uptime = itron.uptime;
           last_aPlus  = itron.aPlus;
           last_aMinus = itron.aMinus;
-          memset(&live_power, 0, sizeof(live_power));
+          est_in.reset();
+          est_out.reset();
           backwards_count = 0;
         }
         itron.valid = 0;  // always discard the backwards reading itself
@@ -2152,13 +2236,13 @@ void sml_data( char *data, size_t len ) {
       meter_seen = true;
       update_period_baselines();
       update_power();
-      // Publish the kWh totals on every valid frame (~1/s) so they appear
-      // promptly after a reboot instead of waiting for the once-per-minute
-      // InfluxDB post below. publish_data() self-dedupes, so this is nearly
-      // free and never spams the broker.
-      #ifdef DTU_TOPIC
+      // InfluxDB every influx_every_frames accepted frames (~10 s); MQTT
+      // per frame, publish_data() self-dedupes and rate-limits.
+      if( ++influx_frames >= influx_every_frames ) {
+        influx_frames = 0;
+        post_data();
+      }
       publish_data();
-      #endif
     }
   }
 
@@ -2172,8 +2256,7 @@ void sml_data( char *data, size_t len ) {
       ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
     stat_total = stat_accepted = stat_backwards = stat_backwards_runs = stat_max_bw_run = stat_power = stat_insane = 0;
     sml_crc_ok = sml_crc_bad = sml_overflow = 0;
-    if( itron.valid == 0x3f ) {  // all bits/entries set: publish itron data
-      post_data();  // InfluxDB stays on the once-per-minute cadence
+    if( itron.valid == 0x3f ) {  // all bits/entries set: log itron data
       if( recv_detailed ) {
         slogf(LOG_NOTICE, "Itron %s", itronString(&itron));
       }
@@ -2350,9 +2433,7 @@ void loop() {
     read_serial_sml();
   }
 
-#ifdef DTU_TOPIC
   handle_mqtt();
-#endif
 
 #ifdef WLED_LEDS
   send_wled();  // also called from sml_data; this covers the no-SML error state
